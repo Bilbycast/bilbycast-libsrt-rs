@@ -7,7 +7,6 @@
 //! Each accepted connection returns an [`SrtSocket`].
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};

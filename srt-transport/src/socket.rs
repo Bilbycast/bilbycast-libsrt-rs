@@ -8,7 +8,6 @@
 //! on send/recv hot paths (except the uncontended recv Mutex).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
