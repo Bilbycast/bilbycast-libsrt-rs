@@ -1,0 +1,17 @@
+[package]
+name = "libsrt-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Raw FFI bindings to Haivision libsrt v1.5.5-rc.2"
+links = "srt"
+
+[features]
+default = []
+# Use system-installed libsrt instead of vendored build
+system-libsrt = []
+
+[build-dependencies]
+bindgen = "0.71.1"
+cmake = "0.1.58"
+pkg-config = "0.3.32"

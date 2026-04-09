@@ -1,0 +1,14 @@
+[package]
+name = "srt-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Async Tokio transport layer wrapping Haivision libsrt — SrtSocket, SrtListener, SrtGroup (bonding)"
+
+[dependencies]
+libsrt-sys = { path = "../libsrt-sys" }
+srt-protocol = { path = "../srt-protocol" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
+bytes = "1.11.1"
+tracing = "0.1.44"
+libc = "0.2.184"

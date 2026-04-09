@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "libsrt-sys",
+    "srt-protocol",
+    "srt-transport",
+]
+resolver = "2"
