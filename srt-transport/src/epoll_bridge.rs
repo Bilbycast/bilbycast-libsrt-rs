@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::net::SocketAddr;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
 
 use bytes::Bytes;
@@ -198,12 +198,12 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
     let mut state_poll_counter: u32 = 0;
     const STATE_POLL_INTERVAL: u32 = 100; // poll socket state every ~100 iterations (~1s)
     let mut sock_id_buf: Vec<SocketId> = Vec::with_capacity(32); // reusable buffer
+    let mut consecutive_epoll_errors: u32 = 0;
 
     loop {
+        // ── Phase 0: Park when completely idle ──────────────────────────
         // When no sockets exist, park the thread until a command arrives.
-        // This eliminates CPU usage when idle — the OS deschedules the thread
-        // entirely. Wakeup is instant when a new socket command is sent via
-        // the channel.
+        // The OS completely deschedules the thread — zero CPU.
         if sockets.is_empty() {
             match cmd_rx.blocking_recv() {
                 Some(cmd) => {
@@ -220,12 +220,11 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
             continue;
         }
 
-        // 1. Drain command channel (non-blocking)
+        // ── Phase 1: Drain command channel (non-blocking) ──────────────
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     if !process_command(cmd, epoll_id, &mut sockets) {
-                        // Shutdown requested
                         cleanup(epoll_id, &mut sockets);
                         return;
                     }
@@ -238,17 +237,57 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
             }
         }
 
-        // 2. Poll epoll for ready sockets.
-        //
-        // Adaptive timeout: controls how often we poll the command and send
-        // channels when no epoll events fire. Sockets subscribe to IN+ERR
-        // only (no OUT) so the loop sleeps for the full timeout when idle.
-        // Sends are drained via the periodic sweep in step 3.
-        //   - 10ms when any socket is connected (fast send-channel drain)
-        //   - 100ms when only listeners/connecting (just command-channel drain)
+        // ── Classify socket activity level ─────────────────────────────
         let has_connected = sockets.values().any(|s| {
             matches!(s.last_status, SocketStatus::Connected)
         });
+        let has_connecting = !has_connected && sockets.values().any(|s| {
+            matches!(s.last_status, SocketStatus::Connecting)
+        });
+
+        // ── IDLE PATH: only listeners / broken sockets, nothing active ─
+        //
+        // srt_epoll_uwait may not reliably block on macOS — it can return
+        // immediately (0 or -1) even with a timeout, burning 100% CPU.
+        // Instead of trusting the timeout, we do a quick non-blocking
+        // epoll check for listener accepts, then explicitly sleep the OS
+        // thread. This guarantees near-zero CPU when no peers are around.
+        if !has_connected && !has_connecting {
+            // Quick non-blocking epoll check (timeout=0) — catches any
+            // listener accept or error events that arrived.
+            let mut events = vec![SRT_EPOLL_EVENT { fd: 0, events: 0 }; MAX_EPOLL_EVENTS];
+            let n = unsafe {
+                srt_epoll_uwait(
+                    epoll_id,
+                    events.as_mut_ptr(),
+                    MAX_EPOLL_EVENTS as c_int,
+                    0, // non-blocking
+                )
+            };
+
+            if n > 0 {
+                process_epoll_events(
+                    &events[..n as usize],
+                    epoll_id,
+                    &mut sockets,
+                    &mut recv_buf,
+                );
+            }
+
+            // Auto-cleanup zombie sockets while we're here.
+            cleanup_zombies(epoll_id, &mut sockets, &mut sock_id_buf);
+
+            // Guaranteed OS sleep — the thread is fully descheduled.
+            // 100ms gives sub-second response to incoming SRT callers
+            // while using effectively zero CPU.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+
+        // ── ACTIVE PATH: at least one connected or connecting socket ───
+        //
+        // Use short epoll timeout for fast send-channel drain (connected)
+        // or responsive connect-completion detection (connecting).
         let timeout_ms = if has_connected { 10 } else { 100 };
 
         let mut events = vec![SRT_EPOLL_EVENT { fd: 0, events: 0 }; MAX_EPOLL_EVENTS];
@@ -262,60 +301,33 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
         };
 
         if n < 0 {
-            // epoll error — may happen during shutdown, just continue
+            // epoll error — sleep to prevent busy-loop on persistent errors.
+            consecutive_epoll_errors += 1;
+            let backoff_ms = 1u64 << consecutive_epoll_errors.min(7);
+            if consecutive_epoll_errors == 10 {
+                tracing::warn!(
+                    "srt-io: 10 consecutive srt_epoll_uwait errors, backing off to {}ms",
+                    backoff_ms,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             continue;
         }
 
-        for i in 0..n as usize {
-            let event = &events[i];
-            let sock_id = event.fd;
-            let ev = event.events as u32;
+        consecutive_epoll_errors = 0;
 
-            // Check if this is a listener with an accepted connection
-            if let Some(state) = sockets.get(&sock_id) {
-                if state.is_listener && (ev & SRT_EPOLL_IN as u32) != 0 {
-                    handle_accept(sock_id, epoll_id, &mut sockets);
-                    continue;
-                }
-            }
-
-            // Handle connect completion
-            if (ev & SRT_EPOLL_CONNECT as u32) != 0 {
-                if let Some(state) = sockets.get_mut(&sock_id) {
-                    if let Some(reply) = state.connect_reply.take() {
-                        let sock_state = unsafe { srt_getsockstate(sock_id) };
-                        if sock_state == SRT_SOCKSTATUS_SRTS_CONNECTED {
-                            let _ = reply.send(Ok(()));
-                            update_status(state, SocketStatus::Connected);
-                        } else {
-                            let _ = reply.send(Err(last_srt_error()));
-                            update_status(state, SocketStatus::Broken);
-                        }
-                    }
-                }
-            }
-
-            // Handle readable
-            if (ev & SRT_EPOLL_IN as u32) != 0 {
-                handle_recv(sock_id, &mut sockets, &mut recv_buf);
-            }
-
-            // Handle writable — drain send queue
-            if (ev & SRT_EPOLL_OUT as u32) != 0 {
-                handle_send(sock_id, &mut sockets);
-            }
-
-            // Handle errors
-            if (ev & SRT_EPOLL_ERR as u32) != 0 {
-                if let Some(state) = sockets.get_mut(&sock_id) {
-                    update_status(state, SocketStatus::Broken);
-                }
-            }
+        if n > 0 {
+            process_epoll_events(
+                &events[..n as usize],
+                epoll_id,
+                &mut sockets,
+                &mut recv_buf,
+            );
         }
 
-        // 3. Drain send channels for all connected sockets (fire-and-forget path).
-        //    Must run every iteration — output sockets don't get IN events,
-        //    so their send channels can only be drained here.
+        // Drain send channels for all connected sockets (fire-and-forget).
+        // Must run every iteration — output sockets don't subscribe to OUT
+        // events, so their send channels can only be drained here.
         if has_connected {
             sock_id_buf.clear();
             sock_id_buf.extend(sockets.keys().copied());
@@ -330,14 +342,10 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
             }
         }
 
-        // 4. Check for state changes on all sockets (poll broken connections).
-        //    Throttled to every STATE_POLL_INTERVAL iterations (~100ms) to
-        //    avoid expensive srt_getsockstate mutex locks on every loop cycle.
-        //    ERR epoll events still catch errors immediately in step 2.
+        // Check for state changes (poll broken connections).
+        // Throttled to every STATE_POLL_INTERVAL iterations (~100ms–1s).
         state_poll_counter += 1;
-        if state_poll_counter >= STATE_POLL_INTERVAL
-            && (has_connected || sockets.values().any(|s| matches!(s.last_status, SocketStatus::Connecting)))
-        {
+        if state_poll_counter >= STATE_POLL_INTERVAL {
             state_poll_counter = 0;
             sock_id_buf.clear();
             sock_id_buf.extend(sockets.keys().copied());
@@ -349,7 +357,6 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
                     if status != state.last_status {
                         update_status(state, status);
 
-                        // If broken/closed and has pending connect reply, notify
                         if matches!(status, SocketStatus::Broken | SocketStatus::Closed) {
                             if let Some(reply) = state.connect_reply.take() {
                                 let _ = reply.send(Err(last_srt_error()));
@@ -358,7 +365,95 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
                     }
                 }
             }
+
+            // Auto-cleanup zombie sockets.
+            cleanup_zombies(epoll_id, &mut sockets, &mut sock_id_buf);
         }
+    }
+}
+
+/// Process epoll events (accepts, connects, reads, writes, errors).
+fn process_epoll_events(
+    events: &[SRT_EPOLL_EVENT],
+    epoll_id: c_int,
+    sockets: &mut HashMap<SocketId, SocketState>,
+    recv_buf: &mut [u8],
+) {
+    for event in events {
+        let sock_id = event.fd;
+        let ev = event.events as u32;
+
+        // Listener accept
+        if let Some(state) = sockets.get(&sock_id) {
+            if state.is_listener && (ev & SRT_EPOLL_IN as u32) != 0 {
+                handle_accept(sock_id, epoll_id, sockets);
+                continue;
+            }
+        }
+
+        // Connect completion
+        if (ev & SRT_EPOLL_CONNECT as u32) != 0 {
+            if let Some(state) = sockets.get_mut(&sock_id) {
+                if let Some(reply) = state.connect_reply.take() {
+                    let sock_state = unsafe { srt_getsockstate(sock_id) };
+                    if sock_state == SRT_SOCKSTATUS_SRTS_CONNECTED {
+                        let _ = reply.send(Ok(()));
+                        update_status(state, SocketStatus::Connected);
+                    } else {
+                        let _ = reply.send(Err(last_srt_error()));
+                        update_status(state, SocketStatus::Broken);
+                    }
+                }
+            }
+        }
+
+        // Readable
+        if (ev & SRT_EPOLL_IN as u32) != 0 {
+            handle_recv(sock_id, sockets, recv_buf);
+        }
+
+        // Writable — drain send queue
+        if (ev & SRT_EPOLL_OUT as u32) != 0 {
+            handle_send(sock_id, sockets);
+        }
+
+        // Errors
+        if (ev & SRT_EPOLL_ERR as u32) != 0 {
+            if let Some(state) = sockets.get_mut(&sock_id) {
+                update_status(state, SocketStatus::Broken);
+            }
+        }
+    }
+}
+
+/// Remove zombie sockets: broken/closed, not a listener or group, and the
+/// Tokio-side handle has been dropped (recv channel closed).
+fn cleanup_zombies(
+    epoll_id: c_int,
+    sockets: &mut HashMap<SocketId, SocketState>,
+    buf: &mut Vec<SocketId>,
+) {
+    buf.clear();
+    for (&id, state) in sockets.iter() {
+        if !matches!(state.last_status, SocketStatus::Broken | SocketStatus::Closed) {
+            continue;
+        }
+        if state.is_listener || state.is_group {
+            continue;
+        }
+        let tokio_side_gone = state.recv_tx.as_ref().map_or(true, |tx| tx.is_closed());
+        if tokio_side_gone {
+            buf.push(id);
+        }
+    }
+    for id in buf.iter().copied() {
+        if let Some(state) = sockets.remove(&id) {
+            if let Some(reply) = state.connect_reply {
+                let _ = reply.send(Err(SrtError::ConnectionLost));
+            }
+        }
+        unsafe { srt_epoll_remove_usock(epoll_id, id) };
+        unsafe { srt_close(id) };
     }
 }
 
@@ -468,6 +563,16 @@ fn process_command(
             state.recv_tx = Some(recv_tx);
             state.send_rx = Some(send_rx);
             state.status_tx = Some(status_tx);
+
+            // Query actual libsrt state — accepted sockets are already Connected
+            // but or_insert_with defaults to Init. Correct it here so the send
+            // loop drains data immediately instead of waiting for the next
+            // STATE_POLL_INTERVAL cycle.
+            let raw_state = unsafe { srt_getsockstate(id) };
+            let actual_status = raw_state_to_status(raw_state);
+            if actual_status != state.last_status {
+                update_status(state, actual_status);
+            }
         }
 
         IoCommand::RegisterListener { id, accept_tx, access_control } => {
@@ -599,7 +704,7 @@ fn handle_recv(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>, 
         let ret = unsafe {
             srt_recvmsg2(
                 sock_id,
-                recv_buf.as_mut_ptr() as *mut i8,
+                recv_buf.as_mut_ptr() as *mut c_char,
                 recv_buf.len() as c_int,
                 std::ptr::null_mut(),
             )
@@ -627,7 +732,7 @@ fn handle_send(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>) 
         let ret = unsafe {
             srt_sendmsg2(
                 sock_id,
-                data.as_ptr() as *const i8,
+                data.as_ptr() as *const c_char,
                 data.len() as c_int,
                 std::ptr::null_mut(),
             )
@@ -652,7 +757,7 @@ fn handle_send(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>) 
                     let ret = unsafe {
                         srt_sendmsg2(
                             sock_id,
-                            data.as_ptr() as *const i8,
+                            data.as_ptr() as *const c_char,
                             data.len() as c_int,
                             std::ptr::null_mut(),
                         )

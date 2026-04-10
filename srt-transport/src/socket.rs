@@ -392,25 +392,37 @@ impl SrtSocketBuilder {
             status_tx,
         });
 
-        // Bind if specified
-        if let Some(bind_addr) = self.bind_addr {
-            let (bind_tx, bind_rx) = oneshot::channel();
-            io.send_command(IoCommand::Bind {
-                id,
-                addr: bind_addr,
-                reply: bind_tx,
-            });
-            bind_rx.await.map_err(|_| SrtError::SocketFail)??;
-        }
+        // Wrap bind+connect in a block so we can clean up the I/O thread
+        // socket on any failure (otherwise it leaks as a zombie).
+        let result = async {
+            // Bind if specified
+            if let Some(bind_addr) = self.bind_addr {
+                let (bind_tx, bind_rx) = oneshot::channel();
+                io.send_command(IoCommand::Bind {
+                    id,
+                    addr: bind_addr,
+                    reply: bind_tx,
+                });
+                bind_rx.await.map_err(|_| SrtError::SocketFail)??;
+            }
 
-        // Connect
-        let (conn_tx, conn_rx) = oneshot::channel();
-        io.send_command(IoCommand::Connect {
-            id,
-            addr: remote,
-            reply: conn_tx,
-        });
-        conn_rx.await.map_err(|_| SrtError::SocketFail)??;
+            // Connect
+            let (conn_tx, conn_rx) = oneshot::channel();
+            io.send_command(IoCommand::Connect {
+                id,
+                addr: remote,
+                reply: conn_tx,
+            });
+            conn_rx.await.map_err(|_| SrtError::SocketFail)??;
+
+            Ok::<(), SrtError>(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            io.send_command(IoCommand::Close { id });
+            return Err(e);
+        }
 
         // Get addresses
         let (local_tx, local_rx) = oneshot::channel();
