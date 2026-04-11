@@ -513,27 +513,24 @@ fn process_command(
                     std::mem::size_of::<libc::sockaddr_storage>() as c_int,
                 )
             };
+            // In non-blocking mode, srt_connect returning 0 means "handshake
+            // initiated", not "connection established". srt_connect returning
+            // -1 with AsyncFail is the same thing. Either way, we must wait
+            // for the socket to actually transition to SRTS_CONNECTED before
+            // reporting success — otherwise the caller will happily "connect"
+            // to a non-existent peer and only discover the truth when the
+            // send buffer fills up.
             if ret < 0 {
                 let err = last_srt_error();
-                // Non-blocking connect returns EASYNC* which is OK
-                if err == SrtError::AsyncFail {
-                    // Connection in progress — store reply for later
-                    add_to_epoll(
-                        epoll_id,
-                        id,
-                        SRT_EPOLL_IN as c_int
-                            | SRT_EPOLL_ERR as c_int | SRT_EPOLL_CONNECT as c_int
-                            | SRT_EPOLL_ET as c_int,
-                    );
-                    if let Some(state) = sockets.get_mut(&id) {
-                        state.connect_reply = Some(reply);
-                        update_status(state, SocketStatus::Connecting);
-                    }
-                } else {
+                if err != SrtError::AsyncFail {
                     let _ = reply.send(Err(err));
+                    return true;
                 }
-            } else {
-                // Immediate success (rare in non-blocking mode)
+                // AsyncFail: fall through to state-based dispatch below.
+            }
+            let sock_state = unsafe { srt_getsockstate(id) };
+            if sock_state == SRT_SOCKSTATUS_SRTS_CONNECTED {
+                // Genuine immediate success — rare but possible.
                 add_to_epoll(
                     epoll_id,
                     id,
@@ -544,6 +541,25 @@ fn process_command(
                     update_status(state, SocketStatus::Connected);
                 }
                 let _ = reply.send(Ok(()));
+            } else if sock_state == SRT_SOCKSTATUS_SRTS_CONNECTING
+                || sock_state == SRT_SOCKSTATUS_SRTS_OPENED
+                || sock_state == SRT_SOCKSTATUS_SRTS_INIT
+            {
+                // Handshake in progress — wait for EPOLL_CONNECT.
+                add_to_epoll(
+                    epoll_id,
+                    id,
+                    SRT_EPOLL_IN as c_int
+                        | SRT_EPOLL_ERR as c_int | SRT_EPOLL_CONNECT as c_int
+                        | SRT_EPOLL_ET as c_int,
+                );
+                if let Some(state) = sockets.get_mut(&id) {
+                    state.connect_reply = Some(reply);
+                    update_status(state, SocketStatus::Connecting);
+                }
+            } else {
+                // BROKEN, CLOSING, CLOSED, NONEXIST — fail immediately.
+                let _ = reply.send(Err(last_srt_error()));
             }
         }
 
@@ -1151,6 +1167,12 @@ fn update_status(state: &mut SocketState, status: SocketStatus) {
     state.last_status = status;
     if let Some(ref tx) = state.status_tx {
         let _ = tx.send(status);
+    }
+    // On terminal states, drop the recv_tx so the Tokio-side recv() unblocks
+    // with ConnectionLost. Without this, callers hang forever on dead sockets
+    // because the channel sender is still held by the I/O thread.
+    if matches!(status, SocketStatus::Broken | SocketStatus::Closed) {
+        state.recv_tx = None;
     }
 }
 

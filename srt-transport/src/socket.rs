@@ -413,7 +413,19 @@ impl SrtSocketBuilder {
                 addr: remote,
                 reply: conn_tx,
             });
-            conn_rx.await.map_err(|_| SrtError::SocketFail)??;
+            // Hard deadline above libsrt's own SRTO_CONNTIMEO (default 3 s).
+            // On macOS with a loopback target whose UDP port is closed, libsrt
+            // can leave the socket in SRTS_CONNECTING indefinitely — no
+            // EPOLL_CONNECT event, no state transition to Broken. Without this
+            // wrapper the `conn_rx` oneshot would never be fulfilled and the
+            // caller's retry loop would wedge on its first attempt.
+            let connect_budget = self.config.connect_timeout + Duration::from_secs(2);
+            match tokio::time::timeout(connect_budget, conn_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Err(_)) => return Err(SrtError::SocketFail),
+                Err(_) => return Err(SrtError::Timeout),
+            }
 
             Ok::<(), SrtError>(())
         }

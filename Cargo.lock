@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "libsrt-sys"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "bindgen",
  "cmake",
@@ -278,11 +278,11 @@ dependencies = [
 
 [[package]]
 name = "srt-protocol"
-version = "0.1.1"
+version = "0.1.3"
 
 [[package]]
 name = "srt-transport"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "libc",
