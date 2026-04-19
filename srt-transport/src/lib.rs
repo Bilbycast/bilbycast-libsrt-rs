@@ -58,5 +58,6 @@ pub use srt_protocol;
 // Re-exports for convenience (matching bilbycast-srt/srt-transport API)
 pub use socket::{SrtSocket, SrtSocketBuilder};
 pub use listener::{SrtListener, SrtListenerBuilder};
-pub use group::{SrtGroup, SrtGroupBuilder, GroupMode};
+pub use group::{GroupMemberStats, GroupMode, SrtGroup, SrtGroupBuilder};
+pub use srt_protocol::config::MemberStatus;
 pub use srt_protocol::access_control::{AccessControl, AccessControlFn, HandshakeInfo};

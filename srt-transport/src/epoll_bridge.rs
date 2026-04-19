@@ -23,7 +23,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use libsrt_sys::*;
-use srt_protocol::config::{CryptoModeConfig, RetransmitAlgo, SocketStatus, SrtConfig, TransType};
+use srt_protocol::config::{CryptoModeConfig, MemberStatus, RetransmitAlgo, SocketStatus, SrtConfig, TransType};
 use srt_protocol::error::SrtError;
 use srt_protocol::stats::SrtStats;
 use srt_protocol::access_control::{AccessControl, HandshakeInfo};
@@ -120,6 +120,11 @@ pub(crate) enum IoCommand {
         id: SocketId,
         endpoints: Vec<SocketAddr>,
         reply: oneshot::Sender<Result<(), SrtError>>,
+    },
+    /// Get per-member statistics for a socket group (bonding).
+    GetGroupMemberStats {
+        id: SocketId,
+        reply: oneshot::Sender<Vec<crate::group::GroupMemberStats>>,
     },
     /// Shutdown the I/O thread.
     Shutdown,
@@ -684,6 +689,11 @@ fn process_command(
             let _ = reply.send(result);
         }
 
+        IoCommand::GetGroupMemberStats { id, reply } => {
+            let members = get_group_member_stats(id);
+            let _ = reply.send(members);
+        }
+
         IoCommand::Shutdown => {
             return false;
         }
@@ -1103,6 +1113,68 @@ fn get_socket_stats(sock: SocketId) -> Result<SrtStats, SrtError> {
     } else {
         Ok(convert_perfmon_to_stats(&perf))
     }
+}
+
+#[allow(non_upper_case_globals)]
+fn map_member_status(raw: SRT_MEMBERSTATUS) -> MemberStatus {
+    match raw {
+        SRT_MemberStatus_SRT_GST_PENDING => MemberStatus::Pending,
+        SRT_MemberStatus_SRT_GST_IDLE => MemberStatus::Idle,
+        SRT_MemberStatus_SRT_GST_RUNNING => MemberStatus::Running,
+        SRT_MemberStatus_SRT_GST_BROKEN => MemberStatus::Broken,
+        _ => MemberStatus::Broken,
+    }
+}
+
+/// Enumerate a socket group's current members and fetch per-member
+/// stats. On any libsrt error (e.g. the group has been closed) returns
+/// an empty vec — per-leg stats are a best-effort snapshot.
+fn get_group_member_stats(group_id: SocketId) -> Vec<crate::group::GroupMemberStats> {
+    // Probe required size. The first call with a null buffer and inoutlen=0
+    // returns the number of member slots libsrt wants to fill.
+    let mut count: usize = 0;
+    let ret =
+        unsafe { srt_group_data(group_id, std::ptr::null_mut(), &mut count as *mut usize) };
+    // srt_group_data returns -1 when the output is too small but sets
+    // `count` to the required length. An error with count==0 means the
+    // group is gone.
+    if ret < 0 && count == 0 {
+        return Vec::new();
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut buf: Vec<SRT_SOCKGROUPDATA> = vec![unsafe { std::mem::zeroed() }; count];
+    let ret =
+        unsafe { srt_group_data(group_id, buf.as_mut_ptr(), &mut count as *mut usize) };
+    if ret < 0 {
+        return Vec::new();
+    }
+    buf.truncate(count);
+    buf.into_iter()
+        .map(|m| {
+            // Map peer address. libsrt fills sockaddr_storage for the remote.
+            let peer_addr = {
+                // SRT's sockaddr_storage mirrors libc's layout.
+                let sa: libc::sockaddr_storage =
+                    unsafe { std::mem::transmute_copy(&m.peeraddr) };
+                sockaddr_storage_to_socket_addr(&sa)
+            };
+            let socket_status = raw_state_to_status(m.sockstate);
+            let member_status = map_member_status(m.memberstate);
+            // Per-member SRT stats. Broken members may fail — use zeroed
+            // defaults so the caller still sees the member entry.
+            let stats = get_socket_stats(m.id).unwrap_or_default();
+            crate::group::GroupMemberStats {
+                id: m.id,
+                peer_addr,
+                socket_status,
+                member_status,
+                weight: m.weight,
+                stats,
+            }
+        })
+        .collect()
 }
 
 fn get_peer_addr(sock: SocketId) -> Option<SocketAddr> {

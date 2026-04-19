@@ -133,6 +133,22 @@ impl SrtSocket {
         reply_rx.await.unwrap_or_else(|_| Ok(SrtStats::default())).unwrap_or_default()
     }
 
+    /// Per-member bonded group statistics.
+    ///
+    /// Returns a non-empty vec when this socket is the listener-side
+    /// handle for an accepted SRT socket group (i.e. the listener had
+    /// `group_connect(true)` enabled and a group caller connected).
+    /// Returns empty for ordinary single-socket connections — safe to
+    /// call unconditionally.
+    pub async fn member_stats(&self) -> Vec<crate::group::GroupMemberStats> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.io.send_command(IoCommand::GetGroupMemberStats {
+            id: self.id,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or_default()
+    }
+
     /// Get the current socket status.
     pub fn status(&self) -> SocketStatus {
         *self.status_rx.borrow()

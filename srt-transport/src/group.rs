@@ -13,11 +13,33 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo, SocketStatus, SrtConfig};
+use srt_protocol::config::{CryptoModeConfig, KeySize, MemberStatus, RetransmitAlgo, SocketStatus, SrtConfig};
 use srt_protocol::error::SrtError;
 use srt_protocol::stats::SrtStats;
 
 use crate::epoll_bridge::{io_handle, IoCommand, IoHandle, SocketId};
+
+/// Per-member state and statistics snapshot for one link inside an
+/// [`SrtGroup`]. Obtained via [`SrtGroup::member_stats`].
+#[derive(Debug, Clone)]
+pub struct GroupMemberStats {
+    /// libsrt member socket ID (opaque handle).
+    pub id: SocketId,
+    /// Peer address this member is connected to (may be `None` if libsrt
+    /// has not yet learned the peer — typical for members in `Pending`).
+    pub peer_addr: Option<SocketAddr>,
+    /// Underlying SRT socket status (connection state).
+    pub socket_status: SocketStatus,
+    /// Group-level member status: Pending / Idle (backup standby) / Running
+    /// (active) / Broken.
+    pub member_status: MemberStatus,
+    /// Member priority (backup mode). 0 means "equal priority"; lower
+    /// values are preferred when multiple members are healthy.
+    pub weight: u16,
+    /// Per-member traffic stats — RTT, rates, packet/byte counters,
+    /// ARQ, FEC. Zeroed when libsrt reports the member as broken.
+    pub stats: SrtStats,
+}
 
 /// SRT group modes for bonding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +105,21 @@ impl SrtGroup {
             reply: reply_tx,
         });
         reply_rx.await.unwrap_or_else(|_| Ok(SrtStats::default())).unwrap_or_default()
+    }
+
+    /// Get per-member stats for every link in this bonded group.
+    ///
+    /// Returns an entry per live (and recently-broken) group member
+    /// with its peer address, socket + member status, priority weight,
+    /// and SRT stats. Returns an empty vec if the group was closed or
+    /// libsrt refused the query.
+    pub async fn member_stats(&self) -> Vec<GroupMemberStats> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.io.send_command(IoCommand::GetGroupMemberStats {
+            id: self.id,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or_default()
     }
 
     /// Get the group mode.
@@ -212,6 +249,71 @@ impl SrtGroupBuilder {
 
     pub fn retransmit_algo(mut self, algo: RetransmitAlgo) -> Self {
         self.config.retransmit_algo = algo;
+        self
+    }
+
+    pub fn receiver_latency(mut self, latency: Duration) -> Self {
+        self.config.recv_latency = latency.as_millis() as u32;
+        self
+    }
+
+    pub fn sender_latency(mut self, latency: Duration) -> Self {
+        self.config.peer_latency = latency.as_millis() as u32;
+        self
+    }
+
+    pub fn input_bw(mut self, bw: i64) -> Self {
+        self.config.input_bw = bw;
+        self
+    }
+
+    pub fn overhead_bw(mut self, pct: i32) -> Self {
+        self.config.overhead_bw = pct;
+        self
+    }
+
+    pub fn enforced_encryption(mut self, enforce: bool) -> Self {
+        self.config.enforced_encryption = enforce;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
+        self
+    }
+
+    pub fn send_drop_delay(mut self, delay: i32) -> Self {
+        self.config.send_drop_delay = delay;
+        self
+    }
+
+    pub fn loss_max_ttl(mut self, ttl: i32) -> Self {
+        self.config.loss_max_ttl = ttl;
+        self
+    }
+
+    pub fn km_refresh_rate(mut self, rate: u32) -> Self {
+        self.config.km_refresh_rate = rate;
+        self
+    }
+
+    pub fn km_pre_announce(mut self, packets: u32) -> Self {
+        self.config.km_pre_announce = packets;
+        self
+    }
+
+    pub fn mss(mut self, mss: u32) -> Self {
+        self.config.mss = mss;
+        self
+    }
+
+    pub fn tlpkt_drop(mut self, enable: bool) -> Self {
+        self.config.tlpkt_drop = enable;
+        self
+    }
+
+    pub fn ip_ttl(mut self, ttl: i32) -> Self {
+        self.config.ip_ttl = ttl;
         self
     }
 

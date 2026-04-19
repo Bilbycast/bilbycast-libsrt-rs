@@ -283,6 +283,22 @@ pub enum SocketStatus {
     NonExist = 9,
 }
 
+/// Per-member status inside an SRT socket group (bonding).
+///
+/// Mirrors libsrt's `SRT_MEMBERSTATUS`. Surfaced via
+/// `SrtGroup::member_stats()` on the transport crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberStatus {
+    /// Member is still negotiating the connection.
+    Pending,
+    /// Member is connected but not currently carrying traffic (standby backup).
+    Idle,
+    /// Member is actively carrying traffic.
+    Running,
+    /// Member connection is broken / dead.
+    Broken,
+}
+
 /// Default SRT live payload size (MPEG-TS: 188 * 7).
 pub const SRT_LIVE_DEF_PLSIZE: u32 = 1316;
 
