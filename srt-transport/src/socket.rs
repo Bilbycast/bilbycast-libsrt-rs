@@ -23,9 +23,21 @@ use crate::epoll_bridge::{io_handle, IoCommand, IoHandle, SocketId};
 ///
 /// All I/O operations are async and communicate with the dedicated I/O thread
 /// via channels. `SrtSocket` is `Send + Sync`.
-/// Bounded send channel capacity. Matches the edge's output send task channel.
-/// If the I/O thread can't keep up, packets are dropped (broadcast-grade behaviour).
-const SEND_CHANNEL_CAPACITY: usize = 256;
+/// Bounded send channel capacity between the async caller of [`SrtSocket::send`]
+/// and the dedicated `srt-io` thread that runs the actual `srt_sendmsg2` calls.
+///
+/// Sized at 8192 slots to provide ~10 s of buffering at 6 Mbps with 1316-byte
+/// payloads. Previously sized at 256, which was small enough that any brief
+/// I/O-thread stall (epoll wakeup, crypto step, FEC parity emission under
+/// high packet rate) filled the channel and surfaced `SrtError::AsyncSend` to
+/// the caller — which `bilbycast-edge` correctly interpreted as a dead
+/// connection and reconnected, producing the "SRT flapping" failure mode seen
+/// in the 2026-04-20 interop run.
+///
+/// `SrtSocket::send` now awaits the channel instead of `try_send`, so even if
+/// the channel does fill, callers naturally backpressure rather than erroring.
+/// The capacity is retained to bound memory in the pathological case.
+const SEND_CHANNEL_CAPACITY: usize = 8192;
 
 pub struct SrtSocket {
     id: SocketId,
@@ -87,15 +99,23 @@ impl SrtSocket {
 
     /// Send data to the peer.
     ///
-    /// Fire-and-forget: data is pushed into a bounded channel that the I/O thread
-    /// drains. If the channel is full (I/O thread can't keep up), the oldest
-    /// unsent data is in the channel and this returns the byte count immediately.
-    /// The I/O thread handles the actual `srt_sendmsg2` call.
+    /// Send `data` over the SRT connection.
+    ///
+    /// Awaits on the bounded channel to the `srt-io` thread, providing natural
+    /// async backpressure when the thread can't keep up. Returns an error only
+    /// when the channel is closed because the underlying socket was torn down
+    /// (`SrtError::ConnectionLost`). This matches the semantics of the sibling
+    /// `bilbycast-srt` pure-Rust implementation.
+    ///
+    /// Prior to the 2026-04-20 fix this method used `try_send` and surfaced
+    /// `SrtError::AsyncSend` whenever the 256-slot channel briefly filled,
+    /// which `bilbycast-edge` treated as a dead connection and reconnected.
     pub async fn send(&self, data: &[u8]) -> Result<usize, SrtError> {
         let len = data.len();
         self.send_tx
-            .try_send(Bytes::copy_from_slice(data))
-            .map_err(|_| SrtError::AsyncSend)?;
+            .send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| SrtError::ConnectionLost)?;
         Ok(len)
     }
 

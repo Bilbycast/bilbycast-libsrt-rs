@@ -79,12 +79,17 @@ impl SrtGroup {
         SrtGroupBuilder::new(mode)
     }
 
-    /// Send data to all group members (fire-and-forget via bounded channel).
+    /// Send data to all group members.
+    ///
+    /// Awaits on the bounded channel to the `srt-io` thread for natural
+    /// backpressure (same fix as `SrtSocket::send` — see the 2026-04-20
+    /// interop report for the `try_send` → reconnect-loop failure mode).
     pub async fn send(&self, data: &[u8]) -> Result<usize, SrtError> {
         let len = data.len();
         self.send_tx
-            .try_send(Bytes::copy_from_slice(data))
-            .map_err(|_| SrtError::AsyncSend)?;
+            .send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| SrtError::ConnectionLost)?;
         Ok(len)
     }
 
@@ -336,7 +341,7 @@ impl SrtGroupBuilder {
 
         // Register channels
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-        let (send_tx, send_rx) = mpsc::channel(256);
+        let (send_tx, send_rx) = mpsc::channel(8192);
         let (status_tx, status_rx) = watch::channel(SocketStatus::Init);
         io.send_command(IoCommand::RegisterSocket {
             id,
