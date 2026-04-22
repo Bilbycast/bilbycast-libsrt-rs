@@ -205,7 +205,19 @@ impl Default for SrtConfig {
             trans_type: TransType::Live,
             message_api: true,
             payload_size: 1316,
-            max_bw: 0,
+            // max_bw = -1 (unlimited) not 0 (libsrt "Live"-default "relative to
+            // input_bw"). The Live default relies on libsrt's internal input-bw
+            // estimator, which is conservative for the first ~1 s and causes
+            // the send buffer to drop packets (past SNDDROPDELAY) when a
+            // bursty upstream (ffmpeg -re, camera initial buffer) exceeds it.
+            // Correlates across legs under 2022-7 so the merger can't hide it,
+            // and blows past the FEC matrix when FEC is layered on top,
+            // triggering libsrt's SRT.pf `FEC: IPE` path. Defaulting unlimited
+            // matches the File-transtype default and the role of this crate:
+            // a forwarding gateway, where upstream pacing is already correct
+            // and libsrt should not second-guess it. Operators can still set
+            // an explicit `max_bw` / `input_bw` if they need per-link caps.
+            max_bw: -1,
             input_bw: 0,
             min_input_bw: 0,
             overhead_bw: 25,

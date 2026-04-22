@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "srt-protocol"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "srt-transport"

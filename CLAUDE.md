@@ -73,3 +73,62 @@ The public API matches bilbycast-srt exactly so bilbycast-edge only needs to cha
 2. **Channel-based communication only** — IoCommand enum dispatched by the I/O thread loop
 3. **Vendored libsrt by default** — ensures v1.5.5-rc.2 with bonding and AEAD support
 4. **Drop-in replacement** — API surface must match bilbycast-srt exactly for edge compatibility
+
+## Default `max_bw = -1` (unlimited send pacing)
+
+`SrtConfig::default()` sets `max_bw = -1` rather than libsrt's Live-transtype
+default of `0`. `max_bw = 0` tells libsrt to pace the sender "relative to
+`input_bw`", but since we also leave `input_bw = 0`, libsrt falls back to
+its internal input-bandwidth *estimator*. The estimator is conservative
+for the first ~1 s and cannot keep up with a bursty upstream source (the
+typical `ffmpeg -re` file read, a camera emptying a kernel buffer on
+session start, etc.). When the burst outruns the pacer, libsrt holds
+packets in the send buffer past `SNDDROPDELAY` (= latency + 10 ms) and
+drops them at the sender — the receiver never sees them and logs
+`RCV-DROPPED N packet(s). Packet seqno %X delayed for ~700 ms`.
+
+This is especially harmful under **SMPTE 2022-7 redundancy**, because
+both legs share the same process and the same bottleneck, so losses
+correlate across legs and the hitless merger has nothing to recover
+from. When FEC is layered on top, the gap exceeds the matrix size and
+trips `SRT.pf: FEC: IPE: Collecting loss from row ...` inside libsrt's
+packet-filter FEC decoder, which further corrupts the output.
+
+Defaulting `max_bw = -1` removes the sender-side pacer entirely. For a
+*forwarding gateway* (which is what this wrapper is used for in
+`bilbycast-edge`), upstream is already correctly paced — libsrt adding
+its own pacing on top only creates warm-up drops. Operators who *do*
+want libsrt to pace (e.g. to enforce a per-link cap on a shared WAN
+link) can still set an explicit `max_bw` or `input_bw` via the socket
+builder / the edge SRT-endpoint config. This matches libsrt's
+File-transtype default, not the Live default.
+
+Knobs considered + rejected:
+- Raising `send_drop_delay` alone: lets packets queue longer, but if
+  the pacer is permanently too slow the queue just grows.
+- Raising `send_buffer_size` alone: doesn't help — the buffer wasn't
+  the constraint, the pacer was.
+- Auto-tuning `input_bw` from measured flow bitrate: the bitrate isn't
+  known until several seconds in, which is after the startup burst has
+  already done its damage. Would require a separate warm-up path.
+
+### 2022-7 / FEC implications for operators
+
+With `max_bw = -1` the TX-side startup burst no longer drops packets,
+which is the precondition for 2022-7 redundancy to deliver any value
+and for FEC to stay within its recovery window. Verified 5-of-5
+consecutive edge↔edge FEC+2022-7 runs on loopback pass with 0 decode
+errors, 0 RCV-DROPPED, 0 FEC-IPE.
+
+Secondary, narrower limitation: the raw-TS dedup path in the edge's
+2022-7 merger (`bilbycast-edge/src/engine/input_srt.rs::process_redundant_packet`)
+uses a per-leg synthetic counter rather than content. In steady state
+both legs deliver packets in the same order (TSBPD enforces that) so
+the counters stay aligned and dedup is correct. Counters drift only
+if **one leg permanently loses a packet** (past TSBPD) that the other
+delivers — after which both legs' Nth-packet-ever are different
+content and duplicates can reach the downstream muxer. Under FEC this
+is rare because single-packet losses are recovered on each leg before
+TSBPD. For asymmetric per-link loss that exceeds the FEC matrix on
+one leg only, wrap the upstream in RTP/TS so the merger has a real
+sequence number to key on.
