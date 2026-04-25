@@ -11,4 +11,4 @@ srt-protocol = { path = "../srt-protocol" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
 bytes = "1.11.1"
 tracing = "0.1.44"
-libc = "0.2.184"
+libc = "0.2.186"

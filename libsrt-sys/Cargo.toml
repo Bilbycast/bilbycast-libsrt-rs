@@ -14,4 +14,4 @@ system-libsrt = []
 [build-dependencies]
 bindgen = "0.72.1"
 cmake = "0.1.58"
-pkg-config = "0.3.32"
+pkg-config = "0.3.33"
