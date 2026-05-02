@@ -1,6 +1,6 @@
 # bilbycast-libsrt-rs
 
-Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.5-rc.2 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets with an API identical to the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation, enabling drop-in replacement in [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge).
+Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.5 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets with an API identical to the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation, enabling drop-in replacement in [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge).
 
 ## Why
 

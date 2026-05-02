@@ -3,7 +3,7 @@
 
 //! Build script for libsrt-sys.
 //!
-//! Default: compile vendored libsrt v1.5.5-rc.2 from `vendor/srt/` via CMake.
+//! Default: compile vendored libsrt v1.5.5 from `vendor/srt/` via CMake.
 //! Override: set `LIBSRT_DIR` env var to point to a pre-built libsrt install.
 //! Override: enable `system-libsrt` feature to use pkg-config.
 
