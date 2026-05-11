@@ -4,6 +4,7 @@ version = "0.1.5"
 edition = "2021"
 license = "MPL-2.0"
 description = "Async Tokio transport layer wrapping Haivision libsrt — SrtSocket, SrtListener, SrtGroup (bonding)"
+publish = false
 
 [dependencies]
 libsrt-sys = { path = "../libsrt-sys" }
