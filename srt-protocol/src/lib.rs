@@ -11,9 +11,11 @@ pub mod access_control;
 pub mod config;
 pub mod error;
 pub mod fec;
+pub mod received_packet;
 pub mod stats;
 
 // Re-exports for convenience (must match bilbycast-srt/srt-protocol exactly)
 pub use config::{KeySize, SrtConfig, SocketStatus, TransType};
 pub use error::{RejectReason, SrtError};
+pub use received_packet::ReceivedPacket;
 pub use stats::SrtStats;

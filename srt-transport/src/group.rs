@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use srt_protocol::received_packet::ReceivedPacket;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use srt_protocol::config::{CryptoModeConfig, KeySize, MemberStatus, RetransmitAlgo, SocketStatus, SrtConfig};
@@ -67,7 +68,7 @@ pub struct SrtGroup {
     id: SocketId,
     io: IoHandle,
     send_tx: mpsc::Sender<Bytes>,
-    recv_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    recv_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ReceivedPacket>>,
     status_rx: watch::Receiver<SocketStatus>,
     mode: GroupMode,
     endpoints: Vec<SocketAddr>,
@@ -93,13 +94,21 @@ impl SrtGroup {
         Ok(len)
     }
 
-    /// Receive data from the group (deduplicated by libsrt).
-    pub async fn recv(&self) -> Result<Bytes, SrtError> {
+    /// Receive a packet from the group (deduplicated by libsrt),
+    /// with sender metadata. Mirrors [`SrtSocket::recv`] — see that
+    /// doc for the metadata-aware semantics.
+    pub async fn recv(&self) -> Result<ReceivedPacket, SrtError> {
         let mut rx = self.recv_rx.lock().await;
         match rx.recv().await {
-            Some(data) => Ok(data),
+            Some(pkt) => Ok(pkt),
             None => Err(SrtError::ConnectionLost),
         }
+    }
+
+    /// Legacy-shape recv that discards sender metadata.
+    #[allow(dead_code)]
+    pub async fn recv_bytes(&self) -> Result<Bytes, SrtError> {
+        self.recv().await.map(|p| p.data)
     }
 
     /// Get aggregate group statistics.

@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
+use srt_protocol::received_packet::ReceivedPacket;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo, SocketStatus, SrtConfig};
@@ -43,7 +44,7 @@ pub struct SrtSocket {
     id: SocketId,
     io: IoHandle,
     send_tx: mpsc::Sender<Bytes>,
-    recv_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    recv_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ReceivedPacket>>,
     status_rx: watch::Receiver<SocketStatus>,
     local_addr: SocketAddr,
     peer_addr: Option<SocketAddr>,
@@ -119,13 +120,28 @@ impl SrtSocket {
         Ok(len)
     }
 
-    /// Receive data from the peer.
-    pub async fn recv(&self) -> Result<Bytes, SrtError> {
+    /// Receive a packet from the peer with sender metadata.
+    ///
+    /// Returns a [`ReceivedPacket`] carrying the payload plus the
+    /// sender's per-packet metadata (libsrt's `SRT_MsgCtrl::srctime`
+    /// in microseconds, when set by the sender). bilbycast-edge's
+    /// `SenderTimestampMaster` consumes this for clock recovery on
+    /// internet-contribution paths. Callers that don't need the
+    /// metadata can use the legacy [`Self::recv_bytes`] convenience.
+    pub async fn recv(&self) -> Result<ReceivedPacket, SrtError> {
         let mut rx = self.recv_rx.lock().await;
         match rx.recv().await {
-            Some(data) => Ok(data),
+            Some(pkt) => Ok(pkt),
             None => Err(SrtError::ConnectionLost),
         }
+    }
+
+    /// Legacy-shape recv that discards the sender metadata. Provided
+    /// for call sites that haven't migrated to the new metadata-aware
+    /// API. Functionally identical to `recv().await.map(|p| p.data)`.
+    #[allow(dead_code)]
+    pub async fn recv_bytes(&self) -> Result<Bytes, SrtError> {
+        self.recv().await.map(|p| p.data)
     }
 
     /// Get the local address.

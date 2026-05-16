@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use libsrt_sys::*;
 use srt_protocol::config::{CryptoModeConfig, MemberStatus, RetransmitAlgo, SocketStatus, SrtConfig, TransType};
 use srt_protocol::error::SrtError;
+use srt_protocol::received_packet::ReceivedPacket;
 use srt_protocol::stats::SrtStats;
 use srt_protocol::access_control::{AccessControl, HandshakeInfo};
 
@@ -68,9 +69,12 @@ pub(crate) enum IoCommand {
         reply: oneshot::Sender<Result<(), SrtError>>,
     },
     /// Register channels for a socket (recv data, send data, status updates).
+    /// `recv_tx` now carries `ReceivedPacket` (payload + sender timestamp)
+    /// so consumers can drive bilbycast-edge's `SenderTimestampMaster`
+    /// without a second recv API.
     RegisterSocket {
         id: SocketId,
-        recv_tx: mpsc::UnboundedSender<Bytes>,
+        recv_tx: mpsc::UnboundedSender<ReceivedPacket>,
         send_rx: mpsc::Receiver<Bytes>,
         status_tx: watch::Sender<SocketStatus>,
     },
@@ -137,7 +141,7 @@ unsafe impl Send for IoCommand {}
 /// Per-socket state tracked on the I/O thread.
 #[allow(dead_code)]
 struct SocketState {
-    recv_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    recv_tx: Option<mpsc::UnboundedSender<ReceivedPacket>>,
     send_rx: Option<mpsc::Receiver<Bytes>>,
     send_backlog: VecDeque<Bytes>,
     status_tx: Option<watch::Sender<SocketStatus>>,
@@ -727,21 +731,34 @@ fn handle_recv(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>, 
             break; // No data available or socket error — exit without calling recv
         }
 
+        // Allocate msgctrl on the I/O thread's stack so we can read
+        // `srctime` (sender-set delivery timestamp in µs since epoch).
+        // bilbycast-edge's master-clock uses this for clock recovery
+        // on internet-contribution paths where MPEG-TS PCR sampled
+        // from the bytes after the TSBPD latency buffer is too bursty
+        // for the PLL to lock. libsrt zeroes the struct on each call;
+        // we only read it after a successful recv.
+        let mut msgctrl: SRT_MsgCtrl_ = unsafe { std::mem::zeroed() };
         let ret = unsafe {
             srt_recvmsg2(
                 sock_id,
                 recv_buf.as_mut_ptr() as *mut c_char,
                 recv_buf.len() as c_int,
-                std::ptr::null_mut(),
+                &mut msgctrl as *mut SRT_MsgCtrl_,
             )
         };
         if ret <= 0 {
             break; // Unexpected: RCVDATA said data exists but recv failed
         }
         let data = Bytes::copy_from_slice(&recv_buf[..ret as usize]);
+        // srctime == 0 ⇒ the sender's msgctrl was NULL on srt_sendmsg2
+        // and libsrt didn't propagate a timestamp. `ReceivedPacket::with_srctime`
+        // maps 0 to `None` so consumers fall through to PCR-from-bytes
+        // recovery; non-zero values feed the sender-timestamp master.
+        let pkt = ReceivedPacket::with_srctime(data, msgctrl.srctime);
         if let Some(state) = sockets.get(&sock_id) {
             if let Some(ref tx) = state.recv_tx {
-                let _ = tx.send(data);
+                let _ = tx.send(pkt);
             }
         }
     }
