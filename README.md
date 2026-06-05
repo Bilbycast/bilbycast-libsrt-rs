@@ -7,7 +7,7 @@ Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.5 
 bilbycast-srt is a pure-Rust SRT implementation with zero C dependencies, but its FEC and encryption interoperability with third-party SRT devices is incomplete. This wrapper uses Haivision's reference C library directly, giving:
 
 - **Guaranteed interop** with all SRT devices (FEC, encryption, handshake)
-- **Native SRT bonding** (Broadcast, Backup, Balancing group modes)
+- **Native SRT bonding** (Broadcast, Backup group modes)
 - **AES-GCM authenticated encryption** via OpenSSL (AEAD API preview)
 - **Wire compatibility** verified against libsrt v1.5.5
 
@@ -64,7 +64,6 @@ Native bonding via libsrt's socket group API:
 
 - **Broadcast** — all links active, deduplication by libsrt (SMPTE 2022-7 style)
 - **Backup** — primary/backup with automatic failover
-- **Balancing** — load distribution across links
 
 ## API Compatibility
 

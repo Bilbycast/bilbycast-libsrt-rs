@@ -56,7 +56,6 @@ All libsrt C API calls happen on a single dedicated OS thread (`srt-io`). Tokio 
 Native SRT bonding via libsrt's socket group API:
 - `GroupMode::Broadcast` — SMPTE 2022-7 (all links active, deduplication by libsrt)
 - `GroupMode::Backup` — primary/backup with failover
-- `GroupMode::Balancing` — load balancing
 
 ### API Compatibility
 
