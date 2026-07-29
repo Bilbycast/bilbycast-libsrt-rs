@@ -1,6 +1,6 @@
 [package]
 name = "srt-protocol"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MPL-2.0"
 description = "SRT protocol types — config, stats, errors, access control (API-compatible with bilbycast-srt)"
