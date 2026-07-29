@@ -2,7 +2,7 @@
 
 ## What Is This
 
-Rust wrapper around Haivision's libsrt v1.5.5 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets with an API matching the bilbycast-srt pure-Rust implementation, enabling drop-in replacement in bilbycast-edge.
+Rust wrapper around Haivision's libsrt v1.5.6 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets with an API matching the bilbycast-srt pure-Rust implementation, enabling drop-in replacement in bilbycast-edge.
 
 ## Projects
 
@@ -70,7 +70,10 @@ The public API matches bilbycast-srt exactly so bilbycast-edge only needs to cha
 
 1. **All libsrt calls on the I/O thread** — never call srt_* from Tokio tasks
 2. **Channel-based communication only** — IoCommand enum dispatched by the I/O thread loop
-3. **Vendored libsrt by default** — ensures v1.5.5 with bonding and AEAD support
+3. **Vendored libsrt by default** — ensures v1.5.6 with bonding and AEAD support. v1.5.6 is a
+   security release: it patches CVE-2026-55869 (pre-auth KMREQ/KMRSP stack-based buffer overflow,
+   CVSS 9.1) and CVE-2026-55868 (forged-KMREQ encryption-state downgrade letting a receiver accept
+   unencrypted data, CVSS 9.1), both of which affect every version <= 1.5.5. Do not pin back.
 4. **Drop-in replacement** — API surface must match bilbycast-srt exactly for edge compatibility
 
 ## Default `max_bw = -1` (unlimited send pacing)
