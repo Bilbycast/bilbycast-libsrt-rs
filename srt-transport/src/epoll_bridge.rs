@@ -444,7 +444,7 @@ fn cleanup_zombies(
 ) {
     buf.clear();
     for (&id, state) in sockets.iter() {
-        if !matches!(state.last_status, SocketStatus::Broken | SocketStatus::Closed) {
+        if !is_terminal_status(state.last_status) {
             continue;
         }
         if state.is_listener || state.is_group {
@@ -1252,7 +1252,30 @@ fn add_to_epoll(epoll_id: c_int, sock: SocketId, events: c_int) {
     }
 }
 
+/// `true` for every libsrt state from which no further I/O is possible.
+///
+/// **All four, not just `Broken | Closed`.** libsrt walks a dying socket
+/// BROKEN → CLOSED → (GC removes it) → NONEXIST, and `garbageCollect` runs on
+/// a 1 s cadence while `removeSocket` fires a tick after that — so
+/// `srt_getsockstate` reports a reapable state for only ~2–3 s. The bridge
+/// samples state on a throttled sweep, so it can easily observe the socket
+/// only *after* that window, landing on `NonExist` (which is also the `_`
+/// catch-all in `raw_state_to_status`). Treating that as non-terminal put the
+/// socket in a dead zone: the send drain is gated on `Connected` so it is
+/// never drained again, and the zombie reaper matched only `Broken | Closed`
+/// so it was never reaped — leaving a Tokio-side `send()` parked on a full
+/// channel **forever**, with no error and no recovery. That is bilbycast-edge
+/// issue #100: an SRT caller output latched `idle` while its peer's listener
+/// sat waiting, cured only by recreating the output.
+pub(crate) fn is_terminal_status(status: SocketStatus) -> bool {
+    matches!(
+        status,
+        SocketStatus::Broken | SocketStatus::Closing | SocketStatus::Closed | SocketStatus::NonExist
+    )
+}
+
 fn update_status(state: &mut SocketState, status: SocketStatus) {
+    let previous = state.last_status;
     state.last_status = status;
     if let Some(ref tx) = state.status_tx {
         let _ = tx.send(status);
@@ -1260,8 +1283,17 @@ fn update_status(state: &mut SocketState, status: SocketStatus) {
     // On terminal states, drop the recv_tx so the Tokio-side recv() unblocks
     // with ConnectionLost. Without this, callers hang forever on dead sockets
     // because the channel sender is still held by the I/O thread.
-    if matches!(status, SocketStatus::Broken | SocketStatus::Closed) {
+    if is_terminal_status(status) {
         state.recv_tx = None;
+        // Same for the send side — but **only** for a socket that was
+        // actually live. A freshly created group reports SRTS_BROKEN at
+        // `RegisterSocket` time, before `ConnectGroup` has run and given it
+        // any members (`CUDTGroup::getStatus` on a memberless group), so an
+        // unguarded drop here would tear the channels off every bonded output
+        // before it ever connected.
+        if matches!(previous, SocketStatus::Connected | SocketStatus::Connecting) {
+            state.send_rx = None;
+        }
     }
 }
 
@@ -1398,5 +1430,59 @@ unsafe fn sockaddr_to_socket_addr(sa: *const libc::sockaddr) -> Option<SocketAdd
             Some(SocketAddr::new(ip.into(), port))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The states libsrt walks a dying socket through, and the reason
+    /// bilbycast-edge #100 latched: `Closing` and `NonExist` are just as
+    /// terminal as `Broken`/`Closed`, but were treated as live.
+    ///
+    /// The window in which `srt_getsockstate` reports `Broken` or `Closed` is
+    /// only ~2-3 s wide (`garbageCollect` runs on a 1 s cadence and
+    /// `removeSocket` fires a tick after `checkBrokenSockets`), while the
+    /// bridge samples state on a throttled sweep. Miss that window and the
+    /// socket settles on `NonExist` — which is also `raw_state_to_status`'s
+    /// `_` catch-all — where the send drain (gated on `Connected`) never runs
+    /// again and the zombie reaper never fires, parking a Tokio-side `send()`
+    /// on a full channel forever.
+    #[test]
+    fn every_non_live_state_is_terminal() {
+        for status in [
+            SocketStatus::Broken,
+            SocketStatus::Closing,
+            SocketStatus::Closed,
+            SocketStatus::NonExist,
+        ] {
+            assert!(is_terminal_status(status), "{status:?} must be terminal");
+        }
+    }
+
+    /// Anything a socket can legitimately be doing while still usable must
+    /// stay non-terminal, or a healthy socket gets reaped mid-handshake.
+    #[test]
+    fn live_and_pre_connection_states_are_not_terminal() {
+        for status in [
+            SocketStatus::Init,
+            SocketStatus::Opened,
+            SocketStatus::Listening,
+            SocketStatus::Connecting,
+            SocketStatus::Connected,
+        ] {
+            assert!(!is_terminal_status(status), "{status:?} must not be terminal");
+        }
+    }
+
+    /// `raw_state_to_status`'s catch-all maps unknown values to `NonExist`,
+    /// so an unrecognised libsrt state must be terminal rather than silently
+    /// treated as live — that is the fail-safe direction.
+    #[test]
+    fn unknown_raw_state_maps_to_a_terminal_status() {
+        let unknown = raw_state_to_status(9999 as SRT_SOCKSTATUS);
+        assert_eq!(unknown, SocketStatus::NonExist);
+        assert!(is_terminal_status(unknown));
     }
 }

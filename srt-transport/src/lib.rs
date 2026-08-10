@@ -64,5 +64,5 @@ pub const BACKEND_NAME: &str = "libsrt";
 pub use socket::{SrtSocket, SrtSocketBuilder};
 pub use listener::{SrtListener, SrtListenerBuilder};
 pub use group::{GroupMemberStats, GroupMode, SrtGroup, SrtGroupBuilder};
-pub use srt_protocol::config::MemberStatus;
+pub use srt_protocol::config::{MemberStatus, SocketStatus};
 pub use srt_protocol::access_control::{AccessControl, AccessControlFn, HandshakeInfo};

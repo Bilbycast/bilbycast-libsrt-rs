@@ -18,7 +18,7 @@ use srt_protocol::config::{CryptoModeConfig, KeySize, RetransmitAlgo, SocketStat
 use srt_protocol::error::SrtError;
 use srt_protocol::stats::SrtStats;
 
-use crate::epoll_bridge::{io_handle, IoCommand, IoHandle, SocketId};
+use crate::epoll_bridge::{io_handle, is_terminal_status, IoCommand, IoHandle, SocketId};
 
 /// An SRT socket connected to a peer.
 ///
@@ -112,6 +112,16 @@ impl SrtSocket {
     /// `SrtError::AsyncSend` whenever the 256-slot channel briefly filled,
     /// which `bilbycast-edge` treated as a dead connection and reconnected.
     pub async fn send(&self, data: &[u8]) -> Result<usize, SrtError> {
+        // Pre-flight the socket state, matching the pure-Rust `bilbycast-srt`
+        // backend's `send()`. Without it the two swappable backends disagree
+        // on a dead peer: this one could only fail once the I/O thread had
+        // dropped the receiver, so a socket the bridge failed to classify as
+        // terminal parked the caller on a full channel indefinitely instead of
+        // erroring (bilbycast-edge #100). Catching it here means a caller
+        // learns on its *next* send rather than depending on reap ordering.
+        if is_terminal_status(self.status()) {
+            return Err(SrtError::ConnectionLost);
+        }
         let len = data.len();
         self.send_tx
             .send(Bytes::copy_from_slice(data))
