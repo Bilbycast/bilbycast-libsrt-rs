@@ -138,6 +138,51 @@ pub(crate) enum IoCommand {
 // The AccessControl Box is Send + Sync + 'static by trait bound.
 unsafe impl Send for IoCommand {}
 
+/// Owner of the heap slot whose address is handed to libsrt as the
+/// `srt_listen_callback` opaque.
+///
+/// `Box<dyn AccessControl>` is a *fat* pointer, so it cannot survive a
+/// round-trip through `*mut c_void`. The slot therefore double-boxes: the
+/// outer allocation holds the fat pointer, and its (thin) address is what
+/// libsrt stores and hands back to [`listen_callback_trampoline`], which
+/// reads the fat pointer out of it.
+///
+/// **The outer allocation is the thing libsrt points at, and it must outlive
+/// every possible invocation of the hook.** Until 2026-08 this code did
+/// `state.access_control = Some(*Box::from_raw(ac_ptr))` immediately after
+/// registering: moving out of a `Box` frees the box's allocation, so the
+/// address libsrt held was dangling from that instant — the trampoline would
+/// have read a fat pointer (data + vtable) out of freed heap and made an
+/// indirect call through it. (It never actually got the chance; see
+/// [`register_listen_callback`] for why the hook was never installed at all.)
+/// Owning the raw pointer here instead means the allocation is reachable
+/// *only* through the pointer libsrt was given and is freed exactly once, by
+/// this `Drop`, when the `SocketState` leaves the map.
+///
+/// Freeing is safe at that point **only because the socket is closed first** —
+/// see [`close_and_release`] for the libsrt locking argument.
+struct AccessControlSlot {
+    ptr: *mut Box<dyn AccessControl>,
+}
+
+impl AccessControlSlot {
+    fn new(ac: Box<dyn AccessControl>) -> Self {
+        Self { ptr: Box::into_raw(Box::new(ac)) }
+    }
+
+    /// The opaque pointer to hand to `srt_listen_callback`.
+    fn opaque(&self) -> *mut std::ffi::c_void {
+        self.ptr as *mut std::ffi::c_void
+    }
+}
+
+impl Drop for AccessControlSlot {
+    fn drop(&mut self) {
+        // Reclaims the outer allocation and drops the `AccessControl` itself.
+        drop(unsafe { Box::from_raw(self.ptr) });
+    }
+}
+
 /// Per-socket state tracked on the I/O thread.
 #[allow(dead_code)]
 struct SocketState {
@@ -147,8 +192,14 @@ struct SocketState {
     status_tx: Option<watch::Sender<SocketStatus>>,
     /// For listener sockets: channel to send accepted socket IDs.
     accept_tx: Option<mpsc::Sender<SocketId>>,
-    /// For listener sockets: access control callback.
-    access_control: Option<Box<dyn AccessControl>>,
+    /// For listener sockets: access control callback, in the stable heap slot
+    /// whose address libsrt holds. Never sent across threads: every
+    /// `SocketState` is created, mutated and dropped inside `io_thread_main`,
+    /// which is why the raw pointer inside (making this type `!Send`) is
+    /// sound. The *pointee* is reached concurrently by libsrt's receive-queue
+    /// worker, which is sound because `AccessControl: Send + Sync` and the
+    /// trampoline only ever takes a shared reference to it.
+    access_control: Option<AccessControlSlot>,
     /// Whether this is a listener socket.
     is_listener: bool,
     /// Whether this is a group socket.
@@ -456,13 +507,15 @@ fn cleanup_zombies(
         }
     }
     for id in buf.iter().copied() {
-        if let Some(state) = sockets.remove(&id) {
+        // Close before dropping the state, for the reason spelled out on
+        // `close_and_release`. Listeners are filtered out above so no
+        // `AccessControlSlot` can reach here today, but the ordering is the
+        // invariant, not the current filter.
+        if let Some(state) = close_and_release(epoll_id, id, sockets) {
             if let Some(reply) = state.connect_reply {
                 let _ = reply.send(Err(SrtError::ConnectionLost));
             }
         }
-        unsafe { srt_epoll_remove_usock(epoll_id, id) };
-        unsafe { srt_close(id) };
     }
 }
 
@@ -493,16 +546,43 @@ fn process_command(
         }
 
         IoCommand::Listen { id, backlog, reply } => {
+            // The access-control hook MUST be armed before `srt_listen` —
+            // libsrt refuses to install it on an already-listening socket, and
+            // silently, at that. See `register_listen_callback`.
+            //
+            // Fail closed. A listener whose configured filter could not be
+            // armed would accept every caller while the operator believes the
+            // filter is running; refusing to listen at all surfaces that as a
+            // bind failure instead of as a silently open ingress port.
+            //
+            // Both failure exits **release the socket**. The only sender of
+            // this command is `SrtListenerBuilder::bind`, which propagates the
+            // error with `?` before an `SrtListener` exists — and `SrtListener`
+            // is the only thing that ever sends `Close`. Leaving the socket
+            // behind would therefore park an already-`srt_bind`ed socket in
+            // libsrt for the life of the process (the zombie reaper skips
+            // listeners), holding its UDP port with nothing left that could
+            // close it: the caller's next bind retry would get EADDRINUSE and
+            // report a port conflict against itself.
+            if let Err(err) = register_listen_callback(id, sockets) {
+                tracing::error!(
+                    "srt-io: refusing to listen on socket {}: access-control hook \
+                     could not be installed ({:?}) — listening would silently \
+                     accept every caller",
+                    id,
+                    err,
+                );
+                close_and_release(epoll_id, id, sockets);
+                let _ = reply.send(Err(err));
+                return true;
+            }
             let ret = unsafe { srt_listen(id, backlog) };
             if ret < 0 {
-                let _ = reply.send(Err(last_srt_error()));
+                // Read the error before `srt_close`, which overwrites it.
+                let err = last_srt_error();
+                close_and_release(epoll_id, id, sockets);
+                let _ = reply.send(Err(err));
             } else {
-                // Register listener callback if access control is set
-                if let Some(state) = sockets.get(&id) {
-                    if state.access_control.is_some() {
-                        register_listen_callback(id, sockets);
-                    }
-                }
                 // Add to epoll for accept notifications
                 add_to_epoll(epoll_id, id, SRT_EPOLL_IN as c_int | SRT_EPOLL_ERR as c_int);
                 if let Some(state) = sockets.get_mut(&id) {
@@ -615,7 +695,7 @@ fn process_command(
             });
             state.accept_tx = Some(accept_tx);
             if let Some(ac) = access_control {
-                state.access_control = Some(ac);
+                state.access_control = Some(AccessControlSlot::new(ac));
             }
         }
 
@@ -642,13 +722,11 @@ fn process_command(
         }
 
         IoCommand::Close { id } => {
-            if let Some(state) = sockets.remove(&id) {
+            if let Some(state) = close_and_release(epoll_id, id, sockets) {
                 if let Some(reply) = state.connect_reply {
                     let _ = reply.send(Err(SrtError::SocketClosed));
                 }
             }
-            unsafe { srt_epoll_remove_usock(epoll_id, id) };
-            unsafe { srt_close(id) };
         }
 
         IoCommand::CreateGroup { mode, config, reply } => {
@@ -706,6 +784,46 @@ fn process_command(
 }
 
 // ── Helper functions (all called on I/O thread only) ──
+
+/// Close a socket in libsrt and *then* release its Rust-side state, returning
+/// whatever state was still registered.
+///
+/// **The order is a memory-safety requirement, not tidiness.** For a listener
+/// carrying an [`AccessControlSlot`], dropping the state frees the allocation
+/// whose address libsrt holds as the accept-hook opaque, so it must not happen
+/// while the hook can still run.
+///
+/// `srt_close` on a listening socket gives exactly that guarantee,
+/// synchronously (paths in the vendored libsrt v1.5.6):
+///   * `CUDTUnited::close` takes the `SRTS_LISTENING` branch and calls
+///     `notListening()` before returning (api.cpp:2172-2195);
+///   * `notListening()` calls `CRcvQueue::removeListener()`
+///     (core.cpp:6583-6590);
+///   * `removeListener` is `m_pListener.compare_exchange(u, NULL)`, which takes
+///     an EXCLUSIVE lock on the queue's listener slot (queue.cpp:1763-1765,
+///     sync.h `CSharedObjectPtr`);
+///   * the receive-queue worker holds a SHARED lock on that same slot across
+///     the whole of `processConnectRequest` → `newConnection` →
+///     `runAcceptHook` → [`listen_callback_trampoline`] (queue.cpp:1454-1471).
+///
+/// So the exclusive acquisition blocks until any in-flight hook has returned,
+/// and once it completes `m_pListener` is NULL and no new invocation can start.
+/// A second close is a no-op (`if (s->core().m_bBroken) return 0;`,
+/// api.cpp:2174) but by then the first close already unhooked it.
+///
+/// Closing an id libsrt no longer knows about is harmless — `locateSocket`
+/// misses and `srt_close` returns `SRT_ERROR` — so this is safe on the
+/// listener-setup failure paths, where the socket may never have reached a
+/// listening state at all.
+fn close_and_release(
+    epoll_id: c_int,
+    id: SocketId,
+    sockets: &mut HashMap<SocketId, SocketState>,
+) -> Option<SocketState> {
+    unsafe { srt_epoll_remove_usock(epoll_id, id) };
+    unsafe { srt_close(id) };
+    sockets.remove(&id)
+}
 
 /// Drain all available messages from the socket's receive buffer.
 ///
@@ -866,44 +984,65 @@ fn handle_accept(
     }
 }
 
-fn register_listen_callback(listener_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>) {
-    // We need to set up the listen callback. libsrt calls the callback from its
-    // internal accept thread. We use a thin C-compatible wrapper that invokes
-    // the Rust AccessControl trait.
-    //
-    // The callback receives an opaque pointer which we use to pass the AccessControl.
-    // We Box::leak the Arc to give it 'static lifetime, and clean up on socket close.
-
-    let state = match sockets.get_mut(&listener_id) {
-        Some(s) => s,
-        None => return,
+/// Arm the listener's access-control hook.
+///
+/// **Call order matters and libsrt will not tell you if you get it wrong.**
+/// `CUDT::installAcceptHook` throws `MJ_NOTSUP / MN_ISCONNECTED` when the
+/// socket is already listening (`if (m_bConnected || m_bConnecting ||
+/// m_bListening || m_bBroken) throw` — vendored `srtcore/core.h:1167-1172`),
+/// and `CUDTUnited::installAcceptHook` swallows that into a plain `SRT_ERROR`
+/// return code (`srtcore/api.cpp:1010-1024`). Until 2026-08 this bridge called
+/// it *after* `srt_listen` and discarded the return value, so the hook was
+/// never installed on any listener: every configured `AccessControl` — in
+/// bilbycast-edge, the `stream_id` filter that is the documented hardening for
+/// an SRT listener input — was inert, and the listener accepted every caller.
+/// Verified against the vendored libsrt: `srt_listen_callback` after
+/// `srt_listen` returns `-1` / "Cannot do this operation on a CONNECTED or
+/// LISTENING socket"; before it, `0`.
+///
+/// Returns `Ok(())` when the socket has no access control (nothing to arm) or
+/// the hook was accepted. The caller must treat an `Err` as fatal to the
+/// listen: an unarmed filter is an open door.
+fn register_listen_callback(
+    listener_id: SocketId,
+    sockets: &HashMap<SocketId, SocketState>,
+) -> Result<(), SrtError> {
+    let Some(state) = sockets.get(&listener_id) else {
+        return Ok(());
+    };
+    let Some(slot) = state.access_control.as_ref() else {
+        return Ok(());
     };
 
-    if let Some(ac) = state.access_control.take() {
-        // Double-box: Box<dyn AccessControl> -> Box<Box<dyn AccessControl>>
-        // This gives us a thin *mut Box<dyn AccessControl> that's safe to
-        // round-trip through *mut c_void (fat pointers can't survive that cast).
-        let ac_ptr = Box::into_raw(Box::new(ac));
-
-        unsafe {
-            srt_listen_callback(
-                listener_id,
-                Some(listen_callback_trampoline),
-                ac_ptr as *mut std::ffi::c_void,
-            );
-        }
-
-        // Store the raw pointer back so we can free it on close
-        state.access_control = Some(unsafe { *Box::from_raw(ac_ptr) });
+    // The opaque stays owned by `slot`, i.e. by this socket's `SocketState`,
+    // and is freed only once the socket has been closed (see
+    // [`close_and_release`]). Handing libsrt a pointer we then free — which is
+    // what this function used to do — leaves the trampoline reading a fat
+    // pointer out of freed heap.
+    let ret = unsafe {
+        srt_listen_callback(
+            listener_id,
+            Some(listen_callback_trampoline),
+            slot.opaque(),
+        )
+    };
+    if ret < 0 {
+        return Err(last_srt_error());
     }
+    Ok(())
 }
 
-/// C-compatible callback for srt_listen_callback.
-/// Called from libsrt's internal accept thread.
+/// C-compatible callback for `srt_listen_callback`.
+///
+/// Called by libsrt from its receive-queue worker thread, on the handshake of
+/// an *unauthenticated* caller — so it is remote-reachable input and must be
+/// conservative. `opaque` is the address of the `Box<dyn AccessControl>` owned
+/// by the listener's [`AccessControlSlot`]; reading the fat pointer out of it
+/// is sound only because that slot outlives `srt_close` on the listener.
 unsafe extern "C" fn listen_callback_trampoline(
     opaque: *mut std::ffi::c_void,
     _ns: SRTSOCKET,
-    _hs_version: c_int,
+    hs_version: c_int,
     peeraddr: *const sockaddr,
     streamid: *const ::std::os::raw::c_char,
 ) -> c_int {
@@ -911,29 +1050,49 @@ unsafe extern "C" fn listen_callback_trampoline(
         return 0; // Accept if no callback
     }
 
-    let ac = &**(opaque as *const Box<dyn AccessControl>);
+    // Unwinding out of an `extern "C"` function aborts the process. The body
+    // below runs operator-supplied code (`on_accept`) and allocates, so a panic
+    // here would take a live broadcast node down from a remote peer's
+    // handshake. Catch it and fail closed — rejecting one caller is strictly
+    // better than aborting, and a panicking access-control decision must never
+    // be read as "accept".
+    let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ac: &dyn AccessControl = unsafe { &**(opaque as *const Box<dyn AccessControl>) };
 
-    // Build HandshakeInfo
-    let peer_addr = sockaddr_to_socket_addr(peeraddr as *const std::ffi::c_void as *const libc::sockaddr);
-    let stream_id = if streamid.is_null() {
-        String::new()
-    } else {
-        std::ffi::CStr::from_ptr(streamid)
-            .to_string_lossy()
-            .into_owned()
-    };
+        let peer_addr = unsafe {
+            sockaddr_to_socket_addr(
+                peeraddr as *const std::ffi::c_void as *const libc::sockaddr,
+            )
+        };
+        let stream_id = if streamid.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(streamid) }
+                .to_string_lossy()
+                .into_owned()
+        };
 
-    let info = HandshakeInfo {
-        peer_addr: peer_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
-        stream_id,
-        is_encrypted: false, // libsrt doesn't expose this in the callback
-        peer_socket_id: 0,   // Not available in callback
-        peer_version: _hs_version,
-    };
+        let info = HandshakeInfo {
+            peer_addr: peer_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            stream_id,
+            is_encrypted: false, // libsrt doesn't expose this in the callback
+            peer_socket_id: 0,   // Not available in callback
+            peer_version: hs_version,
+        };
 
-    match ac.on_accept(&info) {
-        Ok(()) => 0,  // Accept
-        Err(_) => -1, // Reject
+        ac.on_accept(&info)
+    }));
+
+    match verdict {
+        Ok(Ok(())) => 0,  // Accept
+        Ok(Err(_)) => -1, // Reject
+        Err(_) => {
+            tracing::error!(
+                "srt-io: access-control callback panicked on an incoming \
+                 handshake — rejecting the connection"
+            );
+            -1
+        }
     }
 }
 
@@ -1298,14 +1457,20 @@ fn update_status(state: &mut SocketState, status: SocketStatus) {
 }
 
 fn cleanup(epoll_id: c_int, sockets: &mut HashMap<SocketId, SocketState>) {
-    for (id, state) in sockets.drain() {
-        if let Some(reply) = state.connect_reply {
-            let _ = reply.send(Err(SrtError::SocketClosed));
-        }
+    for (id, mut state) in sockets.drain() {
+        // Close before dropping the state — see [`close_and_release`], which
+        // this mirrors (the map is being drained, so it cannot be used here).
+        // Made explicit rather than left to end-of-scope drop order, because an
+        // `AccessControlSlot` freed ahead of `srt_close` is a use-after-free in
+        // libsrt's accept hook.
         unsafe {
             srt_epoll_remove_usock(epoll_id, id);
             srt_close(id);
         }
+        if let Some(reply) = state.connect_reply.take() {
+            let _ = reply.send(Err(SrtError::SocketClosed));
+        }
+        drop(state);
     }
     unsafe {
         srt_epoll_release(epoll_id);
@@ -1484,5 +1649,199 @@ mod tests {
         let unknown = raw_state_to_status(9999 as SRT_SOCKSTATUS);
         assert_eq!(unknown, SocketStatus::NonExist);
         assert!(is_terminal_status(unknown));
+    }
+
+    // ── Listener access control ────────────────────────────────────────
+    //
+    // These cover the two halves of the same defect:
+    //   1. the hook was registered *after* `srt_listen`, which libsrt rejects
+    //      silently, so no `AccessControl` ever ran — an SRT listener with a
+    //      configured `stream_id` filter accepted every caller;
+    //   2. the opaque pointer handed to libsrt was freed immediately after
+    //      registration (`*Box::from_raw(..)` moves out of the box and
+    //      deallocates it), so once (1) was fixed the trampoline would have
+    //      read a fat pointer — data + vtable — out of freed heap.
+    //
+    // Half (1) can only be proved against a real listening socket, and
+    // `srt_bind` starts libsrt worker threads whose teardown SIGSEGVs this
+    // harness at exit. That half therefore lives in
+    // `tests/listener_access_control.rs`, which owns its `main` and leaves via
+    // `libc::_exit(0)`. Nothing below binds.
+
+    use srt_protocol::error::RejectReason;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StreamIdGate(&'static str);
+
+    impl AccessControl for StreamIdGate {
+        fn on_accept(&self, info: &HandshakeInfo) -> Result<(), RejectReason> {
+            if info.stream_id == self.0 {
+                Ok(())
+            } else {
+                Err(RejectReason::Peer)
+            }
+        }
+    }
+
+    struct Panicker;
+
+    impl AccessControl for Panicker {
+        fn on_accept(&self, _info: &HandshakeInfo) -> Result<(), RejectReason> {
+            panic!("access-control policy blew up");
+        }
+    }
+
+    /// Invoke the trampoline exactly the way libsrt does.
+    fn call_trampoline(slot: &AccessControlSlot, peer: &str, stream_id: &str) -> c_int {
+        let sa = socket_addr_to_sockaddr(&peer.parse().unwrap());
+        let sid = CString::new(stream_id).unwrap();
+        unsafe {
+            listen_callback_trampoline(
+                slot.opaque(),
+                0,
+                5,
+                &sa as *const libc::sockaddr_storage as *const std::ffi::c_void as *const sockaddr,
+                sid.as_ptr(),
+            )
+        }
+    }
+
+    /// The trampoline recovers the `AccessControl` by reading a fat pointer
+    /// out of the opaque address libsrt was given. That address must still be
+    /// a live allocation this process owns — which is exactly what the old
+    /// `state.access_control = Some(*Box::from_raw(ac_ptr))` destroyed: it
+    /// moved the inner box out and freed the outer allocation, leaving libsrt
+    /// holding a dangling pointer to the vtable it would call through.
+    #[test]
+    fn trampoline_reads_the_access_control_through_the_registered_opaque() {
+        let slot = AccessControlSlot::new(Box::new(StreamIdGate("letmein")));
+
+        // 0 = accept, -1 = reject, per libsrt's `runAcceptHook`.
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", "letmein"), 0);
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", "not-it"), -1);
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", ""), -1);
+
+        // Still live after use: the slot owns the allocation, nothing else
+        // freed it behind libsrt's back.
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", "letmein"), 0);
+    }
+
+    /// A null opaque means no access control was configured — accept.
+    #[test]
+    fn trampoline_accepts_when_no_access_control_is_registered() {
+        let sa = socket_addr_to_sockaddr(&"10.0.0.9:9000".parse().unwrap());
+        let ret = unsafe {
+            listen_callback_trampoline(
+                std::ptr::null_mut(),
+                0,
+                5,
+                &sa as *const libc::sockaddr_storage as *const std::ffi::c_void as *const sockaddr,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(ret, 0);
+    }
+
+    /// libsrt calls the trampoline from its receive-queue worker on an
+    /// unauthenticated peer's handshake. Unwinding out of an `extern "C"` fn
+    /// aborts the process, so a panicking policy would let a remote caller
+    /// kill a live node. It must be caught, and it must fail *closed*.
+    #[test]
+    fn trampoline_rejects_instead_of_aborting_when_the_policy_panics() {
+        let slot = AccessControlSlot::new(Box::new(Panicker));
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", "anything"), -1);
+    }
+
+    /// The slot now owns the allocation libsrt points at, so ownership has to
+    /// be exactly-once: no leak, no double free.
+    #[test]
+    fn access_control_slot_frees_its_payload_exactly_once() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct Counted;
+
+        impl AccessControl for Counted {
+            fn on_accept(&self, _info: &HandshakeInfo) -> Result<(), RejectReason> {
+                Ok(())
+            }
+        }
+
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let slot = AccessControlSlot::new(Box::new(Counted));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0, "freed while registered");
+        assert_eq!(call_trampoline(&slot, "10.0.0.9:9000", ""), 0);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0, "freed while registered");
+        drop(slot);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1, "leaked or double-freed");
+    }
+
+    /// A `Listen` that refuses to listen must not keep the socket.
+    ///
+    /// The arming failure is fail-closed by design, so this branch is *meant*
+    /// to be taken — which makes leaking there expensive. The only sender of
+    /// `Listen` is `SrtListenerBuilder::bind`, which propagates the error
+    /// before an `SrtListener` exists, and `SrtListener::drop` is the only
+    /// thing that ever sends `Close`; `cleanup_zombies` skips listeners. So a
+    /// socket left in the map here is unreachable forever, and since it is
+    /// already `srt_bind`ed, libsrt holds its UDP port for the life of the
+    /// process. In bilbycast-edge, where listener binds are retried, that
+    /// turns one arming failure into a permanently dead ingress port reported
+    /// as somebody else's `port_conflict`.
+    ///
+    /// Uses a socket id libsrt has already disposed of, which is the one way
+    /// to make `srt_listen_callback` fail without a network: `locateSocket`
+    /// misses and the install returns `SRT_ERROR`. No `srt_bind` happens here,
+    /// so this test starts none of the libsrt worker threads whose teardown
+    /// forces the `tests/listener_access_control.rs` target to exist.
+    #[test]
+    fn listen_releases_the_socket_when_the_access_control_hook_cannot_be_armed() {
+        libsrt_sys::ensure_initialized();
+        let epoll_id = unsafe { srt_epoll_create() };
+        assert!(epoll_id >= 0, "srt_epoll_create failed");
+
+        // A socket id that libsrt no longer knows about.
+        let id = unsafe { srt_create_socket() };
+        assert!(id >= 0, "srt_create_socket failed");
+        assert_eq!(unsafe { srt_close(id) }, 0, "srt_close failed");
+
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
+        let (accept_tx, _accept_rx) = mpsc::channel(4);
+        process_command(
+            IoCommand::RegisterListener {
+                id,
+                accept_tx,
+                access_control: Some(Box::new(StreamIdGate("letmein"))),
+            },
+            epoll_id,
+            &mut sockets,
+        );
+
+        // Pin the precondition: this test is only meaningful if it is the
+        // *arming* that fails, not `srt_listen`.
+        assert!(
+            register_listen_callback(id, &sockets).is_err(),
+            "libsrt installed an accept hook on a disposed socket — this test \
+             is no longer exercising the fail-closed arming branch",
+        );
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(IoCommand::Listen { id, backlog: 5, reply: tx }, epoll_id, &mut sockets);
+        assert!(
+            rx.try_recv().expect("no reply").is_err(),
+            "Listen reported success while its access-control policy could not \
+             be armed — the listener would be silently open",
+        );
+        assert!(
+            !sockets.contains_key(&id),
+            "fail-closed Listen left the socket registered: nothing can ever \
+             close it, so its bound UDP port is held for the life of the process",
+        );
+
+        unsafe { srt_epoll_release(epoll_id) };
     }
 }

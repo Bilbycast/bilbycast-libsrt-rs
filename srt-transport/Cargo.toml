@@ -6,6 +6,18 @@ license = "MPL-2.0"
 description = "Async Tokio transport layer wrapping Haivision libsrt — SrtSocket, SrtListener, SrtGroup (bonding)"
 publish = false
 
+# Every test in here binds a real SRT socket, which starts libsrt's
+# multiplexer / receive-queue worker threads. Those threads are still live when
+# the C++ runtime destroys libsrt's globals at process exit (`srt_cleanup` never
+# runs — `libsrt-sys`'s `SRT_INIT` is a `static OnceLock`, and statics are not
+# dropped), and the teardown race that follows SIGSEGVs the process *after* the
+# assertions have passed. `harness = false` lets the target own `main` and end
+# with `libc::_exit(0)`, so a green run is a real green run and a failing
+# assertion still panics the process red.
+[[test]]
+name = "listener_access_control"
+harness = false
+
 [dependencies]
 libsrt-sys = { path = "../libsrt-sys" }
 srt-protocol = { path = "../srt-protocol" }
