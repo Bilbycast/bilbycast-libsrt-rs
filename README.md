@@ -1,6 +1,6 @@
 # bilbycast-libsrt-rs
 
-Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.6 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets with an API identical to the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation, enabling drop-in replacement in [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge).
+Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.7 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets with an API identical to the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation, enabling drop-in replacement in [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge).
 
 ## Why
 
@@ -9,7 +9,9 @@ bilbycast-srt is a pure-Rust SRT implementation with zero C dependencies, but it
 - **Guaranteed interop** with all SRT devices (FEC, encryption, handshake)
 - **Native SRT bonding** (Broadcast, Backup group modes)
 - **AES-GCM authenticated encryption** via OpenSSL (AEAD API preview)
-- **Wire compatibility** verified against libsrt v1.5.6
+- **Wire compatibility** — built against libsrt v1.5.7; third-party interop last verified
+  against v1.5.6. v1.5.7 is a patch release within the same series (no wire-format change
+  found in review), but the broadcast quality gates have not been re-run on it.
 
 ## Crates
 

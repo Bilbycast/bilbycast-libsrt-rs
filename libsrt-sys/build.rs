@@ -3,15 +3,32 @@
 
 //! Build script for libsrt-sys.
 //!
-//! Default: compile vendored libsrt v1.5.6 from `vendor/srt/` via CMake.
+//! Default: compile vendored libsrt v1.5.7 from `vendor/srt/` via CMake.
 //! Override: set `LIBSRT_DIR` env var to point to a pre-built libsrt install.
 //! Override: enable `system-libsrt` feature to use pkg-config.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    // Cargo tracks NOTHING here without these, and the failure is silent.
+    //
+    // Cargo's "no directives, so rescan the whole package" fallback applies
+    // only when the rerun-if-changed AND rerun-if-env-changed lists are BOTH
+    // empty. `link_crypto_deps()` runs pkg-config, which prints ~47
+    // `rerun-if-env-changed` lines — a non-empty env list with an empty file
+    // list, so cargo stores an env-only fingerprint and watches no file at all.
+    // The vendored submodule, and `wrapper.h` (read at build-script *run* time,
+    // so not a compile-time dependency either), were both invisible.
+    //
+    // The practical consequence: bumping the pinned libsrt and running
+    // `cargo build` relinked the PREVIOUS libsrt.a and reported success. That
+    // held through the v1.5.5 -> v1.5.6 security bump and the v1.5.6 -> v1.5.7
+    // one, where it was found.
+    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-env-changed=LIBSRT_DIR");
 
     // Determine include path and link instructions
     let include_path = if let Ok(libsrt_dir) = env::var("LIBSRT_DIR") {
@@ -66,7 +83,7 @@ fn main() {
 }
 
 /// Build libsrt from vendored source using CMake.
-fn build_vendored(out_dir: &PathBuf) -> PathBuf {
+fn build_vendored(out_dir: &Path) -> PathBuf {
     let srt_source = PathBuf::from("vendor/srt");
     if !srt_source.exists() {
         panic!(
@@ -77,6 +94,20 @@ fn build_vendored(out_dir: &PathBuf) -> PathBuf {
             srt_source.display()
         );
     }
+
+    // The compiled surface, not the whole checkout. `CMakeLists.txt` carries
+    // `set (SRT_VERSION ...)` so it moves on every release bump; the four
+    // directories are what ENABLE_APPS=OFF / ENABLE_TESTING=OFF actually
+    // build, and they catch a pin moved to a mid-series commit that the
+    // version line alone would miss. `apps/`, `test/`, `examples/`, `docs/`
+    // are excluded because we compile none of them — and because cargo walks a
+    // watched directory with a plain recursive stat that does not skip `.git`,
+    // which would be costly if this submodule were ever a full clone.
+    println!("cargo:rerun-if-changed=vendor/srt/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=vendor/srt/srtcore");
+    println!("cargo:rerun-if-changed=vendor/srt/haicrypt");
+    println!("cargo:rerun-if-changed=vendor/srt/common");
+    println!("cargo:rerun-if-changed=vendor/srt/scripts");
 
     let dst = cmake::Config::new(&srt_source)
         .define("ENABLE_SHARED", "OFF")

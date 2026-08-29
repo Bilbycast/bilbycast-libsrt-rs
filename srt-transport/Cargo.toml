@@ -18,6 +18,12 @@ publish = false
 name = "listener_access_control"
 harness = false
 
+# Same reason: this target opens real SRT sockets, so it owns `main` and exits
+# with `libc::_exit(0)` before libsrt's C++ statics are destroyed.
+[[test]]
+name = "wire_round_trip"
+harness = false
+
 [dependencies]
 libsrt-sys = { path = "../libsrt-sys" }
 srt-protocol = { path = "../srt-protocol" }

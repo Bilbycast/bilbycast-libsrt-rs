@@ -2,7 +2,7 @@
 
 ## What Is This
 
-Rust wrapper around Haivision's libsrt v1.5.6 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets with an API matching the bilbycast-srt pure-Rust implementation, enabling drop-in replacement in bilbycast-edge.
+Rust wrapper around Haivision's libsrt v1.5.7 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets with an API matching the bilbycast-srt pure-Rust implementation, enabling drop-in replacement in bilbycast-edge.
 
 ## Projects
 
@@ -70,10 +70,20 @@ The public API matches bilbycast-srt exactly so bilbycast-edge only needs to cha
 
 1. **All libsrt calls on the I/O thread** — never call srt_* from Tokio tasks
 2. **Channel-based communication only** — IoCommand enum dispatched by the I/O thread loop
-3. **Vendored libsrt by default** — ensures v1.5.6 with bonding and AEAD support. v1.5.6 is a
-   security release: it patches CVE-2026-55869 (pre-auth KMREQ/KMRSP stack-based buffer overflow,
-   CVSS 9.1) and CVE-2026-55868 (forged-KMREQ encryption-state downgrade letting a receiver accept
-   unencrypted data, CVSS 9.1), both of which affect every version <= 1.5.5. Do not pin back.
+3. **Vendored libsrt by default** — ensures v1.5.7 with bonding and AEAD support. **Do not pin
+   back**: the last two releases are both security releases, and each fixes something reachable
+   pre-authentication on a public SRT listener.
+   * v1.5.6 patches CVE-2026-55869 (pre-auth KMREQ/KMRSP stack-based buffer overflow, CVSS 9.1)
+     and CVE-2026-55868 (forged-KMREQ encryption-state downgrade letting a receiver accept
+     unencrypted data, CVSS 9.1). Both affect every version <= 1.5.5.
+   * v1.5.7 (upstream #3359, #3323) hardens control-packet handling and fixes two FEC receive-path
+     memory errors. The one that reaches us: `FECFilterBuiltin::ClipData` XOR'd a received packet
+     into a buffer sized from our OWN `SRTO_PAYLOADSIZE`, with no bound — so a peer sending larger
+     packets than we are configured for wrote past the end of the heap allocation, on any SRT
+     input with a `packet_filter` set. Nothing negotiates payload size in the handshake, and
+     bilbycast-edge lets an operator set it anywhere in 188-1456 on either end, so a mismatched
+     pair was reachable with ordinary config. v1.5.7 truncates instead: the FEC group then fails
+     to rebuild, which is the right failure for a mismatched pair.
 4. **Drop-in replacement** — API surface must match bilbycast-srt exactly for edge compatibility
 
 ## Default `max_bw = -1` (unlimited send pacing)

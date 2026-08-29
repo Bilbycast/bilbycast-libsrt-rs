@@ -59,7 +59,7 @@ fn main() {
 ///
 /// `CUDT::installAcceptHook` throws `MJ_NOTSUP / MN_ISCONNECTED` when the
 /// socket is already listening (`if (m_bConnected || m_bConnecting ||
-/// m_bListening || m_bBroken) throw` — vendored `srtcore/core.h:1167-1172`),
+/// m_bListening || m_bBroken) throw` — vendored `srtcore/core.h:1176-1182`),
 /// and `CUDTUnited::installAcceptHook` swallows it into a plain `SRT_ERROR`
 /// (`srtcore/api.cpp:1010-1024`). There is exactly one window in which a hook
 /// can be installed, it closes at `srt_listen`, and nothing throws if you miss

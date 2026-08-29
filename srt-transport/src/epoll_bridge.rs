@@ -794,17 +794,17 @@ fn process_command(
 /// while the hook can still run.
 ///
 /// `srt_close` on a listening socket gives exactly that guarantee,
-/// synchronously (paths in the vendored libsrt v1.5.6):
+/// synchronously (paths in the vendored libsrt v1.5.7):
 ///   * `CUDTUnited::close` takes the `SRTS_LISTENING` branch and calls
 ///     `notListening()` before returning (api.cpp:2172-2195);
 ///   * `notListening()` calls `CRcvQueue::removeListener()`
-///     (core.cpp:6583-6590);
+///     (core.h:585-589);
 ///   * `removeListener` is `m_pListener.compare_exchange(u, NULL)`, which takes
-///     an EXCLUSIVE lock on the queue's listener slot (queue.cpp:1763-1765,
+///     an EXCLUSIVE lock on the queue's listener slot (queue.cpp:1765-1768,
 ///     sync.h `CSharedObjectPtr`);
 ///   * the receive-queue worker holds a SHARED lock on that same slot across
 ///     the whole of `processConnectRequest` → `newConnection` →
-///     `runAcceptHook` → [`listen_callback_trampoline`] (queue.cpp:1454-1471).
+///     `runAcceptHook` → [`listen_callback_trampoline`] (queue.cpp:1456-1474).
 ///
 /// So the exclusive acquisition blocks until any in-flight hook has returned,
 /// and once it completes `m_pListener` is NULL and no new invocation can start.
@@ -989,7 +989,7 @@ fn handle_accept(
 /// **Call order matters and libsrt will not tell you if you get it wrong.**
 /// `CUDT::installAcceptHook` throws `MJ_NOTSUP / MN_ISCONNECTED` when the
 /// socket is already listening (`if (m_bConnected || m_bConnecting ||
-/// m_bListening || m_bBroken) throw` — vendored `srtcore/core.h:1167-1172`),
+/// m_bListening || m_bBroken) throw` — vendored `srtcore/core.h:1176-1182`),
 /// and `CUDTUnited::installAcceptHook` swallows that into a plain `SRT_ERROR`
 /// return code (`srtcore/api.cpp:1010-1024`). Until 2026-08 this bridge called
 /// it *after* `srt_listen` and discarded the return value, so the hook was

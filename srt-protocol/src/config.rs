@@ -10,18 +10,16 @@
 use std::time::Duration;
 
 /// SRT transmission mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransType {
     /// Live streaming mode: low latency, TSBPD, packet dropping.
+    ///
+    /// The default, matching libsrt's own `SRTT_LIVE`: every bilbycast use of
+    /// this crate is contribution or distribution of a live feed.
+    #[default]
     Live,
     /// File transfer mode: reliable delivery, AIMD congestion control.
     File,
-}
-
-impl Default for TransType {
-    fn default() -> Self {
-        Self::Live
-    }
 }
 
 /// Encryption cipher mode selection.
