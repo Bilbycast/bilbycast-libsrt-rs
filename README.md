@@ -1,6 +1,6 @@
 # bilbycast-libsrt-rs
 
-Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.7 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets with an API identical to the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation, enabling drop-in replacement in [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge).
+Rust wrapper around [Haivision libsrt](https://github.com/Haivision/srt) v1.5.7 for the [bilbycast](https://github.com/Bilbycast/bilbycast) media transport ecosystem. Provides async Tokio-compatible SRT sockets whose API is a superset of the [bilbycast-srt](https://github.com/Bilbycast/bilbycast-srt) pure-Rust implementation: the socket, listener and stats surface mirrors it deliberately, while native SRT bonding exists only here. It is the only SRT backend [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge) compiles against.
 
 ## Why
 
@@ -69,7 +69,7 @@ Native bonding via libsrt's socket group API:
 
 ## API Compatibility
 
-The public API is identical to bilbycast-srt. Switching between the two backends in bilbycast-edge requires only changing two path dependencies in `Cargo.toml`:
+This is the only supported SRT backend for bilbycast-edge. The public API is a *superset* of bilbycast-srt's: the socket / listener / stats surface mirrors it deliberately, but the socket-group bonding types (`SrtGroup`, `SrtGroupBuilder`, `GroupMode`, `GroupMemberStats`, `MemberStatus`) exist only here, and bilbycast-edge references them unconditionally in `src/srt/connection.rs` — so swapping the two path dependencies in `Cargo.toml` back to bilbycast-srt no longer compiles (edge issue #102):
 
 - `SrtSocket` / `SrtSocketBuilder` — 30+ builder options
 - `SrtListener` / `SrtListenerBuilder` — accept, bind, access control

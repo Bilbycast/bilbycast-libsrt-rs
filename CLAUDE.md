@@ -2,7 +2,7 @@
 
 ## What Is This
 
-Rust wrapper around Haivision's libsrt v1.5.7 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets with an API matching the bilbycast-srt pure-Rust implementation, enabling drop-in replacement in bilbycast-edge.
+Rust wrapper around Haivision's libsrt v1.5.7 for the bilbycast ecosystem. Provides async Tokio-compatible SRT sockets whose API is a **superset** of the bilbycast-srt pure-Rust implementation: the socket / listener / stats surface mirrors it deliberately, and native SRT bonding (`SrtGroup`, `SrtGroupBuilder`, `GroupMode`, `GroupMemberStats`, `MemberStatus`) exists only here. bilbycast-edge uses that bonding surface unconditionally, so this crate is its only SRT backend.
 
 ## Projects
 
@@ -59,7 +59,7 @@ Native SRT bonding via libsrt's socket group API:
 
 ### API Compatibility
 
-The public API matches bilbycast-srt exactly so bilbycast-edge only needs to change Cargo.toml path dependencies:
+The shared half of the public API mirrors bilbycast-srt; the bonding half has no counterpart there, so swapping the edge's Cargo.toml path dependencies back to bilbycast-srt does not compile (edge issue #102):
 - `SrtSocket` / `SrtSocketBuilder` — same methods (30+ builder options)
 - `SrtListener` / `SrtListenerBuilder` — same accept/bind/access_control pattern
 - `SrtStats` — identical 80+ field struct
@@ -84,7 +84,10 @@ The public API matches bilbycast-srt exactly so bilbycast-edge only needs to cha
      bilbycast-edge lets an operator set it anywhere in 188-1456 on either end, so a mismatched
      pair was reachable with ordinary config. v1.5.7 truncates instead: the FEC group then fails
      to rebuild, which is the right failure for a mismatched pair.
-4. **Drop-in replacement** — API surface must match bilbycast-srt exactly for edge compatibility
+4. **API superset, not a drop-in** — the shared socket / listener / stats surface must stay mirror-compatible with bilbycast-srt (a divergence there has
+   bitten the edge before), but the socket-group bonding surface is libsrt-only and bilbycast-edge references it with no feature gate
+   (`src/srt/connection.rs`, `src/engine/output_srt.rs`, `src/engine/input_srt.rs`). bilbycast-srt is therefore **not** substitutable in the edge today —
+   restoring that would mean feature-gating the edge's entire bonding surface. See edge issue #102.
 
 ## Default `max_bw = -1` (unlimited send pacing)
 
