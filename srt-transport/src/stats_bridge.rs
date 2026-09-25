@@ -75,7 +75,7 @@ pub(crate) fn convert_perfmon_to_stats(perf: &CBytePerfMon) -> SrtStats {
         // Instant measurements
         us_pkt_snd_period: perf.usPktSndPeriod,
         pkt_flow_window: perf.pktFlowWindow,
-        pkt_congestion_window: perf.pktCongestionWindow as i32,
+        pkt_congestion_window: perf.pktCongestionWindow,
         pkt_flight_size: perf.pktFlightSize,
         ms_rtt: perf.msRTT,
         mbps_bandwidth: perf.mbpsBandwidth,

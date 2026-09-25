@@ -441,18 +441,21 @@ fn process_epoll_events(
 ) {
     for event in events {
         let sock_id = event.fd;
-        let ev = event.events as u32;
+        // Read the flags as the enum's own alias type rather than a fixed
+        // width: `SRT_EPOLL_OPT` is `c_uint` under GCC/Clang but `c_int`
+        // under MSVC, so the constants below then need no per-target cast.
+        let ev = event.events as SRT_EPOLL_OPT;
 
         // Listener accept
         if let Some(state) = sockets.get(&sock_id) {
-            if state.is_listener && (ev & SRT_EPOLL_IN as u32) != 0 {
+            if state.is_listener && (ev & SRT_EPOLL_IN) != 0 {
                 handle_accept(sock_id, epoll_id, sockets);
                 continue;
             }
         }
 
         // Connect completion
-        if (ev & SRT_EPOLL_CONNECT as u32) != 0 {
+        if (ev & SRT_EPOLL_CONNECT) != 0 {
             if let Some(state) = sockets.get_mut(&sock_id) {
                 if let Some(reply) = state.connect_reply.take() {
                     let sock_state = unsafe { srt_getsockstate(sock_id) };
@@ -468,17 +471,17 @@ fn process_epoll_events(
         }
 
         // Readable
-        if (ev & SRT_EPOLL_IN as u32) != 0 {
+        if (ev & SRT_EPOLL_IN) != 0 {
             handle_recv(sock_id, sockets, recv_buf);
         }
 
         // Writable — drain send queue
-        if (ev & SRT_EPOLL_OUT as u32) != 0 {
+        if (ev & SRT_EPOLL_OUT) != 0 {
             handle_send(sock_id, sockets);
         }
 
         // Errors
-        if (ev & SRT_EPOLL_ERR as u32) != 0 {
+        if (ev & SRT_EPOLL_ERR) != 0 {
             if let Some(state) = sockets.get_mut(&sock_id) {
                 update_status(state, SocketStatus::Broken);
             }
@@ -501,7 +504,7 @@ fn cleanup_zombies(
         if state.is_listener || state.is_group {
             continue;
         }
-        let tokio_side_gone = state.recv_tx.as_ref().map_or(true, |tx| tx.is_closed());
+        let tokio_side_gone = state.recv_tx.as_ref().is_none_or(|tx| tx.is_closed());
         if tokio_side_gone {
             buf.push(id);
         }
@@ -1405,9 +1408,8 @@ fn get_stream_id(sock: SocketId) -> String {
 }
 
 fn add_to_epoll(epoll_id: c_int, sock: SocketId, events: c_int) {
-    let mut ev = events;
     unsafe {
-        srt_epoll_add_usock(epoll_id, sock, &mut ev);
+        srt_epoll_add_usock(epoll_id, sock, &events);
     }
 }
 
