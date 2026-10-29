@@ -275,6 +275,7 @@ dependencies = [
  "libc",
  "libsrt-sys",
  "srt-protocol",
+ "srt-transport",
  "tokio",
  "tracing",
 ]

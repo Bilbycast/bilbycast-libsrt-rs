@@ -67,6 +67,13 @@ const MAX_EPOLL_EVENTS: usize = 64;
 /// it (vendored `srtcore/api.cpp:1501-1511`), and the bridge connects into a
 /// live group whenever a member is re-added or replaced
 /// ([`check_stranded_members`]).
+///
+/// And it is the only reader of a readiness [`handle_recv`] declined: an IN
+/// edge that arrives while libsrt reads the group as not `SRTS_CONNECTED`
+/// (its only up member just broke, say, and a re-added one is still
+/// connecting) is left set, because only `CUDTGroup::recv` clears it, so no
+/// further edge fires for it once the group is connected again. Without the
+/// sweep that is the permanent stall the `SRTO_RCVDATA` gate used to cause.
 const GROUP_RECV_SWEEP: Duration = Duration::from_millis(100);
 
 // ── Members libsrt strands at connect ──
@@ -114,9 +121,13 @@ const MASKED_MEMBER_RECHECK: Duration = Duration::from_secs(1);
 /// is closed. See [`superseded_linger`].
 const SUPERSEDED_LINGER_SLACK: Duration = Duration::from_secs(1);
 
-/// Members libsrt stranded at connect that the bridge has acted on, process
-/// wide. Members marked stranded by [`IoCommand::TestStrandMember`] are not
-/// counted, so the number says how often libsrt really did it.
+/// Watched members the bridge has replaced or closed, process wide: every
+/// one [`check_stranded_members`] acted on, which is a member listed Pending
+/// (or `CONNECTING`) on a connected socket, one listed Broken on a connected
+/// socket, or one still unresolved past its connect timeout with a socket
+/// that is not dead. Members marked stranded by the test hook
+/// (`IoCommand::TestStrandMember`) are not counted, so the number says how
+/// often libsrt really did one of these.
 static STRANDED_REPAIRS: AtomicU64 = AtomicU64::new(0);
 
 /// See [`STRANDED_REPAIRS`].
@@ -220,7 +231,9 @@ pub(crate) enum IoCommand {
     /// libsrt had stranded it, so [`check_stranded_members`] replaces it with
     /// `endpoint`. Exercises the real close / re-add against libsrt; it does
     /// not exercise libsrt's own overwrite, which only a patched libsrt can
-    /// force. `InvalidParam` when no such member is listed.
+    /// force. `InvalidParam` when no such member is listed. Only in builds
+    /// with the `test-hooks` feature, which this crate's own tests enable.
+    #[cfg(feature = "test-hooks")]
     TestStrandMember {
         id: SocketId,
         endpoint: GroupEndpoint,
@@ -327,7 +340,8 @@ struct WatchedMember {
     /// target, source, weight and token.
     endpoint: GroupEndpoint,
     /// Its socket's own state, read at the start of each check **before**
-    /// the group listing. Scratch, not history.
+    /// the group listing. Scratch, not history; `Init` for a member spawned
+    /// in the current check, which counts as still handshaking.
     live: SocketStatus,
     /// Not looked at before this.
     not_before: Instant,
@@ -339,16 +353,20 @@ struct WatchedMember {
     /// How many replacements stand behind this one (0 = spawned for the
     /// application).
     repairs: u8,
-    /// Stranded members this one replaces that were the group's only
-    /// members up ([`RepairPlan::SpawnThenClose`]). They stay in the group
-    /// until this one is up and has been for [`superseded_linger`], so the
-    /// peer's mirror group is never emptied; closed then, or as soon as this
-    /// one fails.
+    /// Stranded members this one replaces that were the only members up at
+    /// the peer ([`RepairPlan::SpawnThenClose`], [`RepairPlan::HandToSibling`]).
+    /// They stay in the group until this one is up and has been for
+    /// [`superseded_linger`], so the peer's mirror group is never emptied;
+    /// closed then, or as soon as this one fails.
     supersedes: Vec<SocketId>,
     /// When `supersedes` is closed, once this member is up.
     close_superseded_at: Option<Instant>,
-    /// Set by [`IoCommand::TestStrandMember`]: read as stranded.
+    /// Set by the test hook (`IoCommand::TestStrandMember`): read as
+    /// stranded. Never set in a build without the `test-hooks` feature.
     forced: bool,
+    /// Its replacement has been put off for another member's handshake
+    /// ([`RepairPlan::Wait`]), and that has been logged.
+    waiting: bool,
 }
 
 impl WatchedMember {
@@ -364,6 +382,7 @@ impl WatchedMember {
             supersedes: Vec::new(),
             close_superseded_at: None,
             forced: false,
+            waiting: false,
         }
     }
 
@@ -1036,6 +1055,7 @@ fn process_command(
             let _ = reply.send(add_group_member(id, &endpoint, sockets));
         }
 
+        #[cfg(feature = "test-hooks")]
         IoCommand::TestStrandMember { id, endpoint, reply } => {
             let _ = reply.send(force_stranded(id, endpoint, sockets));
         }
@@ -1152,9 +1172,16 @@ fn is_group_id(id: SocketId) -> bool {
 /// Error-level "ABANDONING" line rather than just failing. That status is
 /// `CONNECTED` while some member is Idle or Running — and also while the
 /// first Pending member's own socket is connected, which is a member libsrt
-/// stranded at connect: a group whose only connected member is one of
-/// those is still read, and libsrt logs that line on each read until
+/// stranded at connect. A group whose only connected member is one of those
+/// is still read. libsrt reads that member like any other when it listed it
+/// `CONNECTED`; when it listed it `CONNECTING`, group receive skips it
+/// (vendored `srtcore/group.cpp:2108-2112`), finds no member to read and
+/// logs "ALL LINKS BROKEN, ABANDONING" (`:2428-2432`) on each read until
 /// [`check_stranded_members`] has replaced the member (about a second).
+///
+/// A readiness this declines stays set, so libsrt raises no new edge for
+/// it; [`GROUP_RECV_SWEEP`] is what reads the group once it is connected
+/// again.
 fn handle_recv(
     sock_id: SocketId,
     sockets: &mut HashMap<SocketId, SocketState>,
@@ -1824,12 +1851,12 @@ fn connect_timeout_of(member: SocketId) -> Duration {
 /// plus [`SUPERSEDED_LINGER_SLACK`].
 ///
 /// A stranded member carries nothing, but one that data reached after it
-/// was last read, or one [`IoCommand::TestStrandMember`] marked, can hold
-/// packets the replacement never carried: those sent before the
-/// replacement was first used. Closing it breaks its peer at once,
-/// discarding what that peer still holds inside its latency window, and
-/// discards what this end holds. With no other member up nothing else holds
-/// a copy, so the latency is waited out first.
+/// was last read, or one the test hook (`IoCommand::TestStrandMember`)
+/// marked, can hold packets the replacement never carried: those sent
+/// before the replacement was first used. Closing it breaks its peer at
+/// once, discarding what that peer still holds inside its latency window,
+/// and discards what this end holds. With no other member up nothing else
+/// holds a copy, so the latency is waited out first.
 fn superseded_linger(member: SocketId) -> Duration {
     let latency = |opt: SRT_SOCKOPT| {
         let mut ms: i32 = 0;
@@ -1890,8 +1917,8 @@ enum Verdict {
 
 /// Classify one watched member from its socket's **live** state, read
 /// first, and its row in the group listing read after (`None` when not
-/// listed). `forced` reads it as stranded ([`IoCommand::TestStrandMember`]);
-/// `backup` is the group's mode.
+/// listed). `forced` reads it as stranded (the test hook,
+/// `IoCommand::TestStrandMember`); `backup` is the group's mode.
 ///
 /// Stranded is `live == CONNECTED` while listed Pending, or listed with
 /// `sockstate` `CONNECTING`. libsrt's handshake writes the member Idle
@@ -1901,9 +1928,14 @@ enum Verdict {
 /// listing therefore guarantees the listing sees that write, unless
 /// something wrote over it afterwards. After a member is added only
 /// `groupConnect` writes Pending (`srtcore/api.cpp:1783`, `:1822`), and
-/// nothing turns Pending into anything but Broken — every promotion to
-/// Running starts from Idle. So a caller member read this way is stranded
-/// for good.
+/// nothing turns a Pending **send** state into anything but Broken: both
+/// send paths use only an Idle or Running member and set a Pending one
+/// aside, checking it for failure alone (`srtcore/group.cpp:1289-1335`
+/// broadcast, `:2855-2890` and `:3296-3345` backup). So a caller member
+/// read this way never sends. Its **receive** state is another matter: the
+/// first data packet on the member takes it from Pending to Running
+/// (`srtcore/core.cpp:11131-11136`), and the listing then shows the member
+/// Running (`copyGroupData`, `srtcore/group.cpp:1982`) — the cases below.
 ///
 /// **Sound only for members this bridge spawned into a caller group.** On a
 /// listener's mirror group libsrt marks the socket connected *before* it
@@ -2004,56 +2036,160 @@ fn next_step(w: &mut WatchedMember, verdict: Verdict, now: Instant) -> Step {
 /// How a member found stranded is replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepairPlan {
-    /// Another member for the same endpoint is in flight and still watched
-    /// (re-added by the application meanwhile): it supersedes this one.
-    JoinSibling(SocketId),
-    /// Close it now: a member for the same endpoint is already up, or this
-    /// one has been replaced [`MAX_STRANDED_REPAIRS`] times.
+    /// Close it, and leave re-adding it to the application: it has been
+    /// replaced [`MAX_STRANDED_REPAIRS`] times.
     CloseNow,
-    /// Close it, then connect the same endpoint again: another member of
-    /// the group is up, so the peer's mirror group keeps a member.
+    /// Close it now; another member for the same endpoint replaces it. That
+    /// sibling is up already (no longer watched), or it is still watched —
+    /// re-added by the application meanwhile — and another member is up at
+    /// the peer.
+    JoinSibling(SocketId),
+    /// A watched sibling replaces it, but nothing else is up at the peer:
+    /// the sibling closes this one once it is up (its `supersedes`).
+    HandToSibling(SocketId),
+    /// Close it, then connect the same endpoint again: another member is up
+    /// at the peer, so the peer's mirror group keeps a member.
     CloseThenSpawn,
     /// Connect the same endpoint again, and close this one only once that is
-    /// up: it is the group's only member that is up.
+    /// up: nothing else is up at the peer, or connecting.
     SpawnThenClose,
+    /// Nothing else is up at the peer, but another member is still in its
+    /// handshake: decide once that has resolved, at a later look.
+    Wait,
 }
 
 /// `sibling`: another listed, [`in_flight`] member carrying the same token,
-/// and whether the bridge is still watching it. `others_up`: another member
-/// of the group, carrying any token, is Idle or Running on a connected
-/// socket.
+/// and whether the bridge is still watching it. `others_at_peer`: another
+/// member is up at the peer ([`other_member_at_peer`]). `others_handshaking`:
+/// another member the bridge spawned is still in its handshake
+/// ([`other_member_handshaking`]).
 ///
-/// **Close first when another member is up, make before break only when
-/// none is.** Closing a connected member sends its peer a shutdown, and a
+/// **The peer must never list more members than the bond has, nor none.**
+///
+/// None: closing a connected member sends its peer a shutdown, and a
 /// listener's mirror group that loses its last member fails whole — the
 /// listener drops the session, which is the redial this repair exists to
-/// avoid (and an emptied caller group restarts its sequence numbers). So
-/// when the stranded member is the only one up, it stays until its
-/// replacement is up. But overlapping the two is not free either: the peer
-/// lists both, for that while, as live members of the session, and a
-/// bilbycast-edge listener measures redundancy against the most live
-/// members a session has had — it would count the overlap as one member
-/// more than the bond has, and report one missing for good once the
-/// stranded member left. With another member up, closing first costs
-/// nothing: a stranded member carries nothing, and the peer only sees the
-/// ordinary short dip of a member re-added from a new source port.
-fn repair_plan(repairs: u8, sibling: Option<(SocketId, bool)>, others_up: bool) -> RepairPlan {
+/// avoid (and an emptied caller group restarts its sequence numbers). So a
+/// stranded member that is the only one up at the peer stays until its
+/// replacement is up: make before break.
+///
+/// More: while the two overlap the peer lists both as live members of the
+/// session, and a bilbycast-edge listener measures redundancy against the
+/// most live members a session has had. Any other member up at the peer
+/// during the overlap reads as one member more than the bond has, and once
+/// the stranded member leaves, one is reported missing for good. So
+/// whenever another member is up at the peer, the stranded member is closed
+/// **first** — that costs nothing: a stranded member carries nothing, and
+/// the peer only sees the ordinary short dip of a member re-added from a
+/// new source port — and while another member is still connecting (a slow
+/// path's handshake), which would come up in the middle of an overlap, the
+/// repair waits until it has resolved: up, it makes closing first safe;
+/// failed, make before break is. The wait is bounded by that member's own
+/// connect deadline. It is not free: the stranded member sends nothing and
+/// the connecting one nothing yet, so a connecting member that never comes
+/// up holds a sender's media off until that deadline, where make before
+/// break would have restored it within a second. It is paid only while
+/// nothing is up at the peer and something is still connecting — in
+/// practice a group's first connect with a slow or dark link — and buys a
+/// peer that never miscounts the session for the rest of its life.
+fn repair_plan(
+    repairs: u8,
+    sibling: Option<(SocketId, bool)>,
+    others_at_peer: bool,
+    others_handshaking: bool,
+) -> RepairPlan {
     match sibling {
-        Some((id, true)) => RepairPlan::JoinSibling(id),
-        Some((_, false)) => RepairPlan::CloseNow,
+        Some((id, false)) => RepairPlan::JoinSibling(id),
         None if repairs >= MAX_STRANDED_REPAIRS => RepairPlan::CloseNow,
-        None if others_up => RepairPlan::CloseThenSpawn,
+        Some((id, true)) if others_at_peer => RepairPlan::JoinSibling(id),
+        None if others_at_peer => RepairPlan::CloseThenSpawn,
+        _ if others_handshaking => RepairPlan::Wait,
+        Some((id, true)) => RepairPlan::HandToSibling(id),
         None => RepairPlan::SpawnThenClose,
     }
 }
 
-/// Whether a listed member, other than those in `exclude`, is Idle or
-/// Running on a connected socket.
-fn other_member_up(rows: &[SRT_SOCKGROUPDATA], exclude: &[SocketId]) -> bool {
+/// Whether a listed member is up at its peer as well as here: listed
+/// anything but Broken, on a socket that is connected. A caller member's
+/// socket is connected only once the peer has answered its handshake, so
+/// the peer has it too. That includes a member libsrt stranded, which
+/// sends nothing here but which its peer lists as a live member; a member
+/// listed Broken is left out, as libsrt drops it at its next send.
+fn at_peer(member: MemberStatus, live: SocketStatus) -> bool {
+    member != MemberStatus::Broken && live == SocketStatus::Connected
+}
+
+/// Whether a listed member, other than those in `exclude`, is [`at_peer`].
+/// Its socket is read now, so a member closed earlier in the same check
+/// reads as gone even though the listing still has it.
+fn other_member_at_peer(rows: &[SRT_SOCKGROUPDATA], exclude: &[SocketId]) -> bool {
     rows.iter().filter(|r| !exclude.contains(&r.id)).any(|r| {
-        matches!(map_member_status(r.memberstate), MemberStatus::Idle | MemberStatus::Running)
-            && unsafe { srt_getsockstate(r.id) } == SRTS_CONNECTED
+        at_peer(map_member_status(r.memberstate), raw_state_to_status(unsafe { srt_getsockstate(r.id) }))
     })
+}
+
+/// Whether a watched member, other than those in `exclude`, is still in its
+/// handshake: its socket neither connected nor dead, and its connect
+/// deadline not yet passed. A member spawned earlier in the same check
+/// counts (its state is still `Init`); one past its deadline does not, so a
+/// wait on it is bounded.
+fn other_member_handshaking<'a>(
+    members: impl IntoIterator<Item = &'a WatchedMember>,
+    exclude: &[SocketId],
+    now: Instant,
+) -> bool {
+    members.into_iter().any(|e| {
+        !exclude.contains(&e.id)
+            && e.live != SocketStatus::Connected
+            && !is_terminal_status(e.live)
+            && now < e.resolve_by
+    })
+}
+
+/// The members a repair of `w` closes: `w` and every stranded member it
+/// already supersedes.
+fn repair_chain(w: &WatchedMember) -> Vec<SocketId> {
+    let mut chain = w.supersedes.clone();
+    chain.push(w.id);
+    chain
+}
+
+/// The [`repair_plan`] for watched member `w`, which is still in `watched`.
+/// `spawned` holds the replacements spawned earlier in this check, which
+/// `rows` (read before it) does not list.
+fn plan_repair(
+    w: &WatchedMember,
+    watched: &[WatchedMember],
+    spawned: &[WatchedMember],
+    rows: &[SRT_SOCKGROUPDATA],
+    now: Instant,
+) -> RepairPlan {
+    let token = w.endpoint.token;
+    let chain = repair_chain(w);
+    let sibling = spawned
+        .iter()
+        .find(|e| e.endpoint.token == token)
+        .map(|e| (e.id, true))
+        .or_else(|| {
+            member_in_flight(rows, token, &chain)
+                .map(|id| (id, watched.iter().chain(spawned).any(|e| e.id == id)))
+        });
+    repair_plan(
+        w.repairs,
+        sibling,
+        other_member_at_peer(rows, &chain),
+        other_member_handshaking(watched.iter().chain(spawned), &chain, now),
+    )
+}
+
+/// Why a member [`next_step`] chose to replace is being replaced, for logs.
+fn stranded_reason(verdict: Verdict, forced: bool) -> &'static str {
+    match verdict {
+        Verdict::BrokenLive => "is listed broken by libsrt on a connected socket",
+        Verdict::Handshaking => "is still connecting after its connect timeout",
+        _ if forced => "was marked stranded by the test hook",
+        _ => "finished its handshake but libsrt left it pending",
+    }
 }
 
 /// Close group members the bridge has given up on. Closing a member removes
@@ -2104,16 +2240,25 @@ fn close_members(ids: &[SocketId]) {
 /// Every [`STRANDED_CHECK`] each watched member's live socket state is read,
 /// then the group listing, and [`classify_watched`] judges it. One read
 /// stranded for [`STRANDED_MEMBER_GRACE`] is replaced by connecting the
-/// same [`GroupEndpoint`] again. While another member of the group is up,
-/// the stranded member is closed first; while it is the only one up, it
-/// stays until its replacement is up and has been for
-/// [`superseded_linger`], and is closed then, or as soon as the replacement
-/// fails — closing it first would empty the peer's mirror group, which then
-/// fails whole: the redial this exists to avoid. [`repair_plan`] has why the
-/// two are not simply always overlapped. A member also reads stranded once
-/// its own connect timeout plus [`HANDSHAKE_TTL_SLACK`] has passed with it
-/// still unresolved, whatever the reason, and one listed Broken on a
-/// connected socket (see [`connect_group`]) is replaced the same way.
+/// same [`GroupEndpoint`] again. While another member is up at the peer
+/// ([`at_peer`] — a stranded member counts, as its peer lists it live), the
+/// stranded member is closed first. While none is, it stays until its
+/// replacement is up and has been for [`superseded_linger`], and is closed
+/// then, or as soon as the replacement fails — closing it first would empty
+/// the peer's mirror group, which then fails whole: the redial this exists
+/// to avoid. And while none is but another member is still in its
+/// handshake, the repair waits for that to resolve, up to that member's
+/// connect deadline, so that it cannot come up in the middle of an overlap.
+/// [`repair_plan`] has why the peer must never see an overlap beside
+/// another member. A member also reads stranded once its own connect
+/// timeout plus [`HANDSHAKE_TTL_SLACK`] has passed with it still
+/// unresolved, whatever the reason, and one listed Broken on a connected
+/// socket (see [`connect_group`]) is replaced the same way.
+///
+/// The grace and that wait put a replacement no later than about a second
+/// past a sibling's connect timeout, counted from when the members were
+/// spawned together: inside bilbycast-edge's `degrade_after` (its connect
+/// timeout + 2 s, at least 5 s).
 ///
 /// A replacement is watched like any member, at most
 /// [`MAX_STRANDED_REPAIRS`] deep; past that the stranded member is closed
@@ -2241,10 +2386,28 @@ fn check_group(
                 close_members(&[w.id]);
                 close_members(&w.supersedes);
             }
-            Step::Repair => {
-                let w = watched.swap_remove(idx);
-                repair_stranded(grp, w, verdict, rows, &mut watched, &mut spawned, now);
-            }
+            Step::Repair => match plan_repair(&watched[idx], &watched, &spawned, rows, now) {
+                RepairPlan::Wait => {
+                    let w = &mut watched[idx];
+                    if !w.waiting {
+                        w.waiting = true;
+                        tracing::debug!(
+                            "srt-io: group {} member @{} (token {}) {}; replacing it once another \
+                             member's handshake has resolved, so its peer never lists more members \
+                             than the bond has",
+                            grp,
+                            w.id,
+                            w.endpoint.token,
+                            stranded_reason(verdict, w.forced),
+                        );
+                    }
+                    idx += 1;
+                }
+                plan => {
+                    let w = watched.swap_remove(idx);
+                    repair_stranded(grp, w, verdict, plan, &mut watched, &mut spawned, now);
+                }
+            },
         }
     }
     watched.extend(spawned);
@@ -2264,13 +2427,14 @@ fn check_group(
     }
 }
 
-/// Act on a watched member [`next_step`] chose to replace. `watched` holds
-/// the group's other watched members; a new replacement goes to `spawned`.
+/// Carry out `plan` ([`plan_repair`], never [`RepairPlan::Wait`]) for a
+/// watched member [`next_step`] chose to replace. `watched` holds the
+/// group's other watched members; a new replacement goes to `spawned`.
 fn repair_stranded(
     grp: SocketId,
     w: WatchedMember,
     verdict: Verdict,
-    rows: &[SRT_SOCKGROUPDATA],
+    plan: RepairPlan,
     watched: &mut [WatchedMember],
     spawned: &mut Vec<WatchedMember>,
     now: Instant,
@@ -2278,32 +2442,14 @@ fn repair_stranded(
     if !w.forced {
         STRANDED_REPAIRS.fetch_add(1, Ordering::Relaxed);
     }
-    let what = match verdict {
-        Verdict::BrokenLive => "is listed broken by libsrt on a connected socket",
-        Verdict::Handshaking => "is still connecting after its connect timeout",
-        _ if w.forced => "was marked stranded by the test hook",
-        _ => "finished its handshake but libsrt left it pending",
-    };
+    let what = stranded_reason(verdict, w.forced);
     let token = w.endpoint.token;
-    let mut chain = w.supersedes.clone();
-    chain.push(w.id);
-    // `rows` was read before this pass, so a replacement spawned earlier in
-    // it is not listed there: look for one of those first.
-    let sibling = spawned
-        .iter()
-        .find(|e| e.endpoint.token == token)
-        .map(|e| (e.id, true))
-        .or_else(|| {
-            member_in_flight(rows, token, &chain)
-                .map(|id| (id, watched.iter().chain(spawned.iter()).any(|e| e.id == id)))
-        });
-
-    let others_up = other_member_up(rows, &chain);
-    match repair_plan(w.repairs, sibling, others_up) {
-        RepairPlan::JoinSibling(other) => {
+    let chain = repair_chain(&w);
+    match plan {
+        RepairPlan::JoinSibling(other) | RepairPlan::HandToSibling(other) => {
             tracing::warn!(
                 "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would never \
-                 carry a packet; @{} already re-connects that endpoint and will replace it",
+                 carry a packet; @{} already carries or re-connects that endpoint and replaces it",
                 grp,
                 w.id,
                 token,
@@ -2312,33 +2458,33 @@ fn repair_stranded(
                 what,
                 other,
             );
-            // Closed now while another member is up, else handed to the
-            // sibling to close once it is up: see `repair_plan`.
-            match watched.iter_mut().chain(spawned.iter_mut()).find(|e| e.id == other) {
-                Some(e) if !others_up => e.supersedes.extend(chain),
-                _ => close_members(&chain),
+            // Closed now while another member is up at the peer, else
+            // handed to the sibling to close once it is up: see
+            // `repair_plan`.
+            let hand_to = (plan == RepairPlan::HandToSibling(other))
+                .then(|| watched.iter_mut().chain(spawned.iter_mut()).find(|e| e.id == other))
+                .flatten();
+            match hand_to {
+                Some(e) => e.supersedes.extend(chain),
+                None => close_members(&chain),
             }
         }
         RepairPlan::CloseNow => {
-            let why = if sibling.is_some() {
-                "another member already carries that endpoint".to_string()
-            } else {
-                format!("repair limit {MAX_STRANDED_REPAIRS} reached; left for the application to re-add")
-            };
             tracing::warn!(
                 "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would never \
-                 carry a packet; closed it ({})",
+                 carry a packet; closed it (repair limit {} reached; left for the application to \
+                 re-add)",
                 grp,
                 w.id,
                 token,
                 w.endpoint.addr,
                 w.endpoint.local_addr,
                 what,
-                why,
+                MAX_STRANDED_REPAIRS,
             );
             close_members(&chain);
         }
-        plan @ (RepairPlan::CloseThenSpawn | RepairPlan::SpawnThenClose) => {
+        RepairPlan::CloseThenSpawn | RepairPlan::SpawnThenClose => {
             let close_first = plan == RepairPlan::CloseThenSpawn;
             if close_first {
                 close_members(&chain);
@@ -2350,7 +2496,7 @@ fn repair_stranded(
                     } else {
                         format!(
                             "re-connected the same endpoint as @{new}, and will close @{} once that \
-                             is up, as it is the only member up",
+                             is up, as nothing else is up at the peer",
                             w.id
                         )
                     };
@@ -2393,11 +2539,13 @@ fn repair_stranded(
                 }
             }
         }
+        RepairPlan::Wait => unreachable!("check_group keeps a member that waits"),
     }
 }
 
 /// [`IoCommand::TestStrandMember`]: mark the healthy member carrying
 /// `endpoint.token` stranded.
+#[cfg(feature = "test-hooks")]
 fn force_stranded(
     id: SocketId,
     endpoint: GroupEndpoint,
@@ -3167,27 +3315,77 @@ mod tests {
     /// One handshake per endpoint, and a bounded chain of replacements.
     #[test]
     fn repair_plan_joins_a_sibling_and_stops_at_the_cap() {
-        for others_up in [false, true] {
-            assert_eq!(repair_plan(MAX_STRANDED_REPAIRS, None, others_up), RepairPlan::CloseNow);
-            assert_eq!(repair_plan(0, Some((7, true)), others_up), RepairPlan::JoinSibling(7));
-            assert_eq!(repair_plan(0, Some((7, false)), others_up), RepairPlan::CloseNow);
+        for (at_peer, handshaking) in [(false, false), (false, true), (true, false), (true, true)] {
+            let plan = |repairs, sibling| repair_plan(repairs, sibling, at_peer, handshaking);
+            // Up already, so no longer watched: it carries the endpoint.
+            assert_eq!(plan(0, Some((7, false))), RepairPlan::JoinSibling(7));
+            assert_eq!(plan(MAX_STRANDED_REPAIRS, Some((7, false))), RepairPlan::JoinSibling(7));
+            // The cap stops a chain of replacements, never a sibling.
+            assert_eq!(plan(MAX_STRANDED_REPAIRS, None), RepairPlan::CloseNow);
+            assert_ne!(plan(MAX_STRANDED_REPAIRS, Some((7, true))), RepairPlan::CloseNow);
+        }
+    }
+
+    /// The peer must never list more members than the bond has, nor none:
+    /// close first whenever another member is up at the peer; make before
+    /// break only when none is and none is connecting; otherwise wait for
+    /// the connecting one to resolve.
+    #[test]
+    fn repair_plan_overlaps_only_when_nothing_else_is_up_or_connecting() {
+        for repairs in [0, MAX_STRANDED_REPAIRS - 1] {
+            for handshaking in [false, true] {
+                assert_eq!(repair_plan(repairs, None, true, handshaking), RepairPlan::CloseThenSpawn);
+                assert_eq!(
+                    repair_plan(repairs, Some((7, true)), true, handshaking),
+                    RepairPlan::JoinSibling(7)
+                );
+            }
+            assert_eq!(repair_plan(repairs, None, false, true), RepairPlan::Wait);
+            assert_eq!(repair_plan(repairs, Some((7, true)), false, true), RepairPlan::Wait);
+            assert_eq!(repair_plan(repairs, None, false, false), RepairPlan::SpawnThenClose);
             assert_eq!(
-                repair_plan(MAX_STRANDED_REPAIRS, Some((7, true)), others_up),
-                RepairPlan::JoinSibling(7)
+                repair_plan(repairs, Some((7, true)), false, false),
+                RepairPlan::HandToSibling(7)
             );
         }
     }
 
-    /// Close first while another member is up: the peer keeps a member, and
-    /// sees no more live members than the bond has. Make before break only
-    /// for the group's only member that is up, whose closing would empty the
-    /// peer's mirror group and fail it whole.
+    /// Up at the peer: anything but Broken on a connected socket — a
+    /// stranded member included, as its peer lists it live.
     #[test]
-    fn repair_plan_breaks_first_unless_it_is_the_only_member_up() {
-        assert_eq!(repair_plan(0, None, true), RepairPlan::CloseThenSpawn);
-        assert_eq!(repair_plan(MAX_STRANDED_REPAIRS - 1, None, true), RepairPlan::CloseThenSpawn);
-        assert_eq!(repair_plan(0, None, false), RepairPlan::SpawnThenClose);
-        assert_eq!(repair_plan(MAX_STRANDED_REPAIRS - 1, None, false), RepairPlan::SpawnThenClose);
+    fn at_peer_is_any_unbroken_member_on_a_connected_socket() {
+        for m in [M::Pending, M::Idle, M::Running] {
+            assert!(at_peer(m, S::Connected), "{m:?}");
+            for live in [S::Init, S::Opened, S::Connecting, S::Broken, S::Closed, S::NonExist] {
+                assert!(!at_peer(m, live), "{m:?} on {live:?}");
+            }
+        }
+        assert!(!at_peer(M::Broken, S::Connected), "libsrt drops it at its next send");
+    }
+
+    /// A handshake is waited on only while its socket is neither connected
+    /// nor dead, and only until its connect deadline; the member being
+    /// repaired, and what it supersedes, never count.
+    #[test]
+    fn only_a_live_handshake_inside_its_deadline_is_waited_on() {
+        let t0 = Instant::now();
+        let at = |live| {
+            let mut w = watched(t0);
+            w.live = live;
+            w
+        };
+        let before = t0 + Duration::from_secs(1);
+        // Spawned earlier in the same check: `Init` until the next.
+        for live in [S::Init, S::Opened, S::Connecting] {
+            assert!(other_member_handshaking([&at(live)], &[], before), "{live:?}");
+        }
+        for live in [S::Connected, S::Broken, S::Closing, S::Closed, S::NonExist] {
+            assert!(!other_member_handshaking([&at(live)], &[], before), "{live:?}");
+        }
+        let connecting = at(S::Connecting);
+        assert!(!other_member_handshaking([&connecting], &[], connecting.resolve_by), "past its deadline");
+        assert!(!other_member_handshaking([&connecting], &[connecting.id], before), "excluded");
+        assert!(!other_member_handshaking(std::iter::empty::<&WatchedMember>(), &[], before));
     }
 
     /// What `add_group_member` treats as an endpoint already being carried.

@@ -22,11 +22,14 @@
 //! back to Pending after its handshake has already finished, and then never
 //! sends on it, while every listing shows it as still connecting. The I/O
 //! thread replaces such a member itself, within about a second, by closing
-//! it and connecting the same endpoint again — or, when it is the group's
-//! only member up, by connecting again first and closing it once the
+//! it and connecting the same endpoint again — or, when no other member is
+//! up at the peer, by connecting again first and closing it once the
 //! replacement is up, so a listing can briefly show two members with one
-//! token. Up to three times per member; past that it is closed and left to
-//! the application like a broken one. Details in `epoll_bridge.rs`,
+//! token. While no other member is up but one is still connecting, it waits
+//! for that handshake to resolve first (at most that member's connect
+//! timeout), so the peer never lists more members than the group has. Up to
+//! three times per member; past that it is closed and left to the
+//! application like a broken one. Details in `epoll_bridge.rs`,
 //! `check_stranded_members`.
 
 use std::net::SocketAddr;
@@ -271,7 +274,9 @@ impl SrtGroup {
     /// `ep.token` as if libsrt had stranded it, so that it is replaced with
     /// `ep` exactly as a really stranded member is — a real close and
     /// re-add against libsrt. `InvalidParam` when no Idle or Running member
-    /// with that token is connected.
+    /// with that token is connected. Only with the `test-hooks` feature,
+    /// which this crate's own tests turn on and nothing else should.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn test_strand_member(&self, ep: GroupEndpoint) -> Result<(), SrtError> {
         ep.check()?;

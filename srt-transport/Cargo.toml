@@ -30,6 +30,14 @@ harness = false
 name = "group_members"
 harness = false
 
+[features]
+# `SrtGroup::test_strand_member`, which makes the I/O thread replace a
+# healthy group member as if libsrt had stranded it. For this crate's own
+# tests only: the dev-dependency on this crate below turns it on for
+# `cargo test` / `cargo clippy --all-targets`, and no build of a consumer
+# (bilbycast-edge) carries it.
+test-hooks = []
+
 [dependencies]
 libsrt-sys = { path = "../libsrt-sys" }
 srt-protocol = { path = "../srt-protocol" }
@@ -37,3 +45,9 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "sync", "
 bytes = "1.12.1"
 tracing = "0.1.44"
 libc = "0.2.190"
+
+[dev-dependencies]
+# Itself, with the test hooks: a self dev-dependency resolves to this same
+# package, so the library its tests link is built with `test-hooks`, while a
+# plain build, and every consumer, is not.
+srt-transport = { path = ".", features = ["test-hooks"] }

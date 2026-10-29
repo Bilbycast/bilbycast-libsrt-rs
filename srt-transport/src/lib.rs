@@ -75,10 +75,13 @@ pub use group::{
 pub use srt_protocol::config::{MemberStatus, SocketStatus};
 pub use srt_protocol::access_control::{AccessControl, AccessControlFn, HandshakeInfo};
 
-/// How many group members libsrt stranded at connect (handshake finished,
-/// listed Pending for good) the I/O thread has replaced or closed in this
-/// process. Diagnostics and tests; members marked by
-/// [`SrtGroup::test_strand_member`] are not counted.
+/// How many watched group members the I/O thread has replaced or closed in
+/// this process: members libsrt stranded at connect (handshake finished,
+/// listed Pending, or `CONNECTING`, on a connected socket), members listed
+/// Broken on a connected socket, and members still unresolved past their
+/// connect timeout on a socket that is not dead. Diagnostics and tests;
+/// members marked by the `test-hooks` feature's
+/// `SrtGroup::test_strand_member` are not counted.
 #[doc(hidden)]
 pub fn stranded_member_repairs() -> u64 {
     epoll_bridge::stranded_member_repairs()

@@ -132,6 +132,10 @@ fn main() {
     println!("test a_groups_only_connected_member_is_replaced_in_place ... ok");
     passed += 1;
 
+    rt.block_on(a_stranded_member_waits_for_a_connecting_sibling());
+    println!("test a_stranded_member_waits_for_a_connecting_sibling ... ok");
+    passed += 1;
+
     #[cfg(target_os = "linux")]
     {
         rt.block_on(a_stranded_backup_standby_is_replaced());
@@ -415,11 +419,11 @@ async fn a_dark_first_member_stalls_neither_receiver() {
         ms.iter().filter(|m| healthy(m)).count() == 2
     })
     .await;
-    assert_eq!(group.member_stats().await[0].token, 0, "caller group lists the direct link first");
+    assert_eq!(group.member_stats().await[0].token, 0, "caller group lists the dark (hole) link first");
     assert_eq!(
         accepted.member_stats().await[0].id,
         dark_on_listener,
-        "listener group lists the direct link first"
+        "listener group lists the dark (hole) link first"
     );
 
     // A message is its sequence number only if its whole payload is intact.
@@ -791,10 +795,11 @@ async fn a_caller_group_survives_its_own_connect_and_carries_media_both_ways() {
 //
 // `SrtGroup::test_strand_member` marks a healthy member as if libsrt had
 // stranded it; the bridge then replaces it exactly as a really stranded one:
-// close it and connect the same endpoint again while another member is up,
-// or connect again first and close it once the replacement is up when it is
-// the only one. These pin that the replacement is invisible to the media
-// and to both ends' view of the group.
+// close it and connect the same endpoint again while another member is up
+// at the peer, or connect again first and close it once the replacement is
+// up when none is — after waiting for any member still connecting. These
+// pin that the replacement is invisible to the media and to both ends' view
+// of the group.
 
 /// The sequence number a numbered [`message`] carries, or `u32::MAX` when
 /// its payload is not intact.
@@ -994,6 +999,88 @@ async fn a_groups_only_connected_member_is_replaced_in_place() {
     assert_eq!(group.status(), SocketStatus::Connected);
     assert_all_in_order("listener", &at_listener, sent_by_caller);
     assert_all_in_order("caller group", &at_caller, sent_by_listener);
+
+    let _ = group.close().await;
+    let _ = accepted.close().await;
+    let _ = listener.close().await;
+}
+
+/// A stranded member with no other member up, but one still connecting, is
+/// not replaced until that handshake has resolved, so the peer never lists
+/// more members than the group has.
+///
+/// Make before break would overlap the stranded member with its
+/// replacement, and the peer would list both as live; had the connecting
+/// member come up in the middle, it would list three members of a
+/// two-member bond, and a bilbycast-edge listener, which measures
+/// redundancy against the most live members a session has had, would then
+/// report one missing for good. So the bridge waits for the connecting one:
+/// up, it closes the stranded member first; failed, make before break is
+/// safe.
+async fn a_stranded_member_waits_for_a_connecting_sibling() {
+    let mut listener = group_listener().await;
+    let target = listener.local_addr();
+    let hole = Blackhole::start(target).await;
+    hole.set_dropping(true);
+    let direct = GroupEndpoint::new(target, 0);
+    let slow = GroupEndpoint::new(hole.addr, 1);
+    // A connect timeout well past the hole's opening below, so the slow
+    // member is still connecting, not failed, when it opens.
+    let group = SrtGroup::builder(GroupMode::Broadcast)
+        .live_mode()
+        .latency(Duration::from_millis(120))
+        .peer_idle_timeout(Duration::from_secs(1))
+        .connect_timeout(Duration::from_secs(6))
+        .add_member(direct)
+        .add_member(slow)
+        .connect()
+        .await
+        .expect("group connect");
+    let accepted = Arc::new(accept(&mut listener).await);
+    let before = wait_caller(&group, "member 0 healthy", |ms| token_healthy(ms, 0)).await;
+    let stranded = healthy_id(&before, 0);
+    assert!(!token_healthy(&before, 1), "member 1 came up through a closed hole: {before:#?}");
+
+    // Every listing of the listener's group until `stop`: the most live
+    // members it ever showed at once.
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = {
+        let (accepted, stop) = (accepted.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut peak = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let live: Vec<_> = accepted.member_stats().await.into_iter().filter(healthy).collect();
+                if live.len() > peak.len() {
+                    peak = live;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            peak
+        })
+    };
+
+    group.test_strand_member(direct).await.expect("mark member 0 stranded");
+    // Past the grace and several checks: replaced by now, but for the wait.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let waiting = group.member_stats().await;
+    assert!(
+        waiting.iter().filter(|m| m.token == 0).map(|m| m.id).eq([stranded]),
+        "member 0 was replaced while member 1 was still connecting: {waiting:#?}"
+    );
+
+    hole.set_dropping(false);
+    wait_caller(&group, "member 1 up and member 0 replaced", |ms| {
+        token_healthy(ms, 1) && replaced(ms, 0, stranded)
+    })
+    .await;
+    wait_listener(&accepted, "two live members", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let peak = peak.await.unwrap();
+    assert!(peak.len() <= 2, "the listener listed more live members than the bond has: {peak:#?}");
 
     let _ = group.close().await;
     let _ = accepted.close().await;
