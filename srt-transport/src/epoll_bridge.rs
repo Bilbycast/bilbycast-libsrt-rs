@@ -414,6 +414,12 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
                 let status = raw_state_to_status(raw_state);
 
                 if let Some(state) = sockets.get_mut(&id) {
+                    // A group is `Init` from `RegisterSocket` until
+                    // `ConnectGroup` gives it members, and libsrt reads a
+                    // memberless group as BROKEN — see `RegisterSocket`.
+                    if state.is_group && state.last_status == SocketStatus::Init {
+                        continue;
+                    }
                     if status != state.last_status {
                         update_status(state, status);
 
@@ -483,10 +489,37 @@ fn process_epoll_events(
         // Errors
         if (ev & SRT_EPOLL_ERR) != 0 {
             if let Some(state) = sockets.get_mut(&sock_id) {
+                if state.is_group && !group_err_is_real(sock_id) {
+                    continue;
+                }
                 update_status(state, SocketStatus::Broken);
             }
         }
     }
+}
+
+/// Whether an `SRT_EPOLL_ERR` reported on a **group** means the group has
+/// failed, judged by the group's own status.
+///
+/// libsrt raises ERR readiness on a group that has not failed: adding a
+/// group to an epoll (`CUDTGroup::addEPoll`) sets ERR when no member is
+/// "non-broken", and it tests that with `CUDTSocket::broken()`, which is
+/// `m_bBroken || !m_bConnected` — true for a member whose handshake is
+/// merely still running. `ConnectGroup` adds the group to the bridge's
+/// epoll straight after the non-blocking `srt_connect_group`, when every
+/// member is necessarily still connecting, so every caller group was handed
+/// an ERR at birth: the bridge marked it `Broken`, dropped both channels,
+/// and a bonded caller never carried a packet — each connect ended at once
+/// in a send or receive `ConnectionLost` and a redial.
+///
+/// `getStatus` is the group's real state (`SRTS_CONNECTED` while any member
+/// is Idle or Running, the pending member's state while one is connecting,
+/// `SRTS_BROKEN` when none is left). A genuine all-links-down ERR agrees
+/// with it; one that does not is ignored, and the bridge's periodic state
+/// poll still reads `getStatus` and tears the group down within about a
+/// second if it does fail later.
+fn group_err_is_real(group: SocketId) -> bool {
+    is_terminal_status(raw_state_to_status(unsafe { srt_getsockstate(group) }))
 }
 
 /// Remove zombie sockets: broken/closed, not a listener or group, and the
@@ -676,10 +709,19 @@ fn process_command(
             // but or_insert_with defaults to Init. Correct it here so the send
             // loop drains data immediately instead of waiting for the next
             // STATE_POLL_INTERVAL cycle.
-            let raw_state = unsafe { srt_getsockstate(id) };
-            let actual_status = raw_state_to_status(raw_state);
-            if actual_status != state.last_status {
-                update_status(state, actual_status);
+            //
+            // Not for a group (`CreateGroup` registered it first, so
+            // `is_group` is already set): it is registered *before*
+            // `ConnectGroup` gives it any members, and libsrt reports a
+            // memberless group as `SRTS_BROKEN`. Applying that here dropped
+            // `recv_tx`, so a bonded caller's `recv` failed before it was
+            // ever connected. A group's status starts at `ConnectGroup`.
+            if !state.is_group {
+                let raw_state = unsafe { srt_getsockstate(id) };
+                let actual_status = raw_state_to_status(raw_state);
+                if actual_status != state.last_status {
+                    update_status(state, actual_status);
+                }
             }
         }
 
@@ -1447,11 +1489,11 @@ fn update_status(state: &mut SocketState, status: SocketStatus) {
     if is_terminal_status(status) {
         state.recv_tx = None;
         // Same for the send side — but **only** for a socket that was
-        // actually live. A freshly created group reports SRTS_BROKEN at
-        // `RegisterSocket` time, before `ConnectGroup` has run and given it
-        // any members (`CUDTGroup::getStatus` on a memberless group), so an
-        // unguarded drop here would tear the channels off every bonded output
-        // before it ever connected.
+        // actually live. A freshly created group reports SRTS_BROKEN until
+        // `ConnectGroup` has run and given it members (`CUDTGroup::getStatus`
+        // on a memberless group); `RegisterSocket` no longer applies that to
+        // a group, and this guard keeps any other pre-connect terminal
+        // reading from tearing the send channel off before it ever connected.
         if matches!(previous, SocketStatus::Connected | SocketStatus::Connecting) {
             state.send_rx = None;
         }
@@ -1641,6 +1683,53 @@ mod tests {
         ] {
             assert!(!is_terminal_status(status), "{status:?} must not be terminal");
         }
+    }
+
+    /// A group is registered before `ConnectGroup` gives it members, and
+    /// libsrt reads a memberless group as `SRTS_BROKEN`. Applying that at
+    /// registration dropped the receive channel, so a bonded caller's `recv`
+    /// failed before it ever connected.
+    #[test]
+    fn registering_a_fresh_group_keeps_its_channels() {
+        libsrt_sys::ensure_initialized();
+        let epoll_id = unsafe { srt_epoll_create() };
+        assert!(epoll_id >= 0, "srt_epoll_create failed");
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(
+            IoCommand::CreateGroup {
+                mode: SRT_GTYPE_BROADCAST,
+                config: {
+                    let mut c = SrtConfig::default();
+                    c.live_defaults();
+                    c
+                },
+                reply: tx,
+            },
+            epoll_id,
+            &mut sockets,
+        );
+        let grp = rx.try_recv().expect("no reply").expect("srt_create_group failed");
+        // The premise: libsrt does call the memberless group broken.
+        assert!(is_terminal_status(raw_state_to_status(unsafe { srt_getsockstate(grp) })));
+        assert!(group_err_is_real(grp));
+
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (_send_tx, send_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = watch::channel(SocketStatus::Init);
+        process_command(
+            IoCommand::RegisterSocket { id: grp, recv_tx, send_rx, status_tx },
+            epoll_id,
+            &mut sockets,
+        );
+        let state = &sockets[&grp];
+        assert!(state.recv_tx.is_some(), "registration dropped the group's receive channel");
+        assert!(state.send_rx.is_some(), "registration dropped the group's send channel");
+        assert_eq!(state.last_status, SocketStatus::Init);
+
+        close_and_release(epoll_id, grp, &mut sockets);
+        unsafe { srt_epoll_release(epoll_id) };
     }
 
     /// `raw_state_to_status`'s catch-all maps unknown values to `NonExist`,

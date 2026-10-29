@@ -24,6 +24,12 @@ harness = false
 name = "wire_round_trip"
 harness = false
 
+# Same reason: real group sockets, so it owns `main` and leaves via
+# `libc::_exit(0)`.
+[[test]]
+name = "group_members"
+harness = false
+
 [dependencies]
 libsrt-sys = { path = "../libsrt-sys" }
 srt-protocol = { path = "../srt-protocol" }
