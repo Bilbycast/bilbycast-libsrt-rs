@@ -25,9 +25,10 @@
 //! it and connecting the same endpoint again — or, when no other member is
 //! up at the peer, by connecting again first and closing it once the
 //! replacement is up, so a listing can briefly show two members with one
-//! token. While no other member is up but one is still connecting, it waits
-//! for that handshake to resolve first (at most that member's connect
-//! timeout), so the peer never lists more members than the group has. Up to
+//! token. While no other member is up but one is still connecting, or is
+//! listed Broken and being replaced in turn, it waits for that to resolve
+//! first (up to about a second past that member's connect timeout), so the
+//! peer never lists more members than the group has. Up to
 //! three times per member; past that it is closed and left to the
 //! application like a broken one. Details in `epoll_bridge.rs`,
 //! `check_stranded_members`.
