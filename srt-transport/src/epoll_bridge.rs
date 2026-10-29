@@ -873,12 +873,25 @@ fn process_command(
 /// misses and `srt_close` returns `SRT_ERROR` — so this is safe on the
 /// listener-setup failure paths, where the socket may never have reached a
 /// listening state at all.
+///
+/// A group still at `Init` is not unsubscribed first: a group joins the
+/// epoll only when `ConnectGroup` succeeds, which also moves it off `Init`
+/// (the state poll skips a group at `Init`, so nothing else does). That is
+/// the group `SrtGroupBuilder::connect` closes when its connect spawned no
+/// member, and libsrt logs unsubscribing it as an internal error at Error
+/// level ("IPE: … NOT SUBSCRIBED"), once per failed attempt of a retrying
+/// caller.
 fn close_and_release(
     epoll_id: c_int,
     id: SocketId,
     sockets: &mut HashMap<SocketId, SocketState>,
 ) -> Option<SocketState> {
-    unsafe { srt_epoll_remove_usock(epoll_id, id) };
+    let never_polled = sockets
+        .get(&id)
+        .is_some_and(|s| s.is_group && s.last_status == SocketStatus::Init);
+    if !never_polled {
+        unsafe { srt_epoll_remove_usock(epoll_id, id) };
+    }
     unsafe { srt_close(id) };
     sockets.remove(&id)
 }
@@ -1944,6 +1957,87 @@ mod tests {
         );
 
         close_and_release(epoll_id, grp, &mut sockets);
+        unsafe { srt_epoll_release(epoll_id) };
+    }
+
+    /// A group joins the bridge's epoll only when `ConnectGroup` succeeds.
+    /// `SrtGroupBuilder::connect` closes the group whose connect spawned no
+    /// member, still at `Init`; asking libsrt to unsubscribe it from an
+    /// epoll it never joined makes libsrt log an internal error at Error
+    /// level ("IPE: update struck E… which is NOT SUBSCRIBED to @…"), once
+    /// per failed attempt of a caller retrying an unbindable source.
+    #[test]
+    fn closing_a_group_that_never_connected_logs_no_internal_error() {
+        use std::ffi::{CStr, c_void};
+        use std::sync::Mutex;
+
+        static NOT_SUBSCRIBED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn capture(
+            _opaque: *mut c_void,
+            _level: c_int,
+            _file: *const c_char,
+            _line: c_int,
+            _area: *const c_char,
+            message: *const c_char,
+        ) {
+            if message.is_null() {
+                return;
+            }
+            let line = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
+            if line.contains("NOT SUBSCRIBED") {
+                if let Ok(mut lines) = NOT_SUBSCRIBED.lock() {
+                    lines.push(line);
+                }
+            }
+        }
+
+        libsrt_sys::ensure_initialized();
+        let epoll_id = unsafe { srt_epoll_create() };
+        assert!(epoll_id >= 0, "srt_epoll_create failed");
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(
+            IoCommand::CreateGroup {
+                mode: SRT_GTYPE_BROADCAST,
+                config: {
+                    let mut c = SrtConfig::default();
+                    c.live_defaults();
+                    c
+                },
+                reply: tx,
+            },
+            epoll_id,
+            &mut sockets,
+        );
+        let grp = rx.try_recv().expect("no reply").expect("srt_create_group failed");
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (_send_tx, send_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = watch::channel(SocketStatus::Init);
+        process_command(
+            IoCommand::RegisterSocket { id: grp, recv_tx, send_rx, status_tx },
+            epoll_id,
+            &mut sockets,
+        );
+        assert_eq!(sockets[&grp].last_status, SocketStatus::Init);
+
+        // libsrt logs on the closing thread, so the line, if any, is in by
+        // the time the close returns. Other tests' lines are told apart by
+        // the group id.
+        unsafe { srt_setloghandler(std::ptr::null_mut(), Some(capture)) };
+        process_command(IoCommand::Close { id: grp }, epoll_id, &mut sockets);
+        unsafe { srt_setloghandler(std::ptr::null_mut(), None) };
+
+        assert!(!sockets.contains_key(&grp), "the group's bridge entry was kept");
+        let ours = format!("@{grp}");
+        let hits: Vec<String> = NOT_SUBSCRIBED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(&ours))
+            .cloned()
+            .collect();
+        assert!(hits.is_empty(), "closing a never-connected group logged: {hits:?}");
         unsafe { srt_epoll_release(epoll_id) };
     }
 
