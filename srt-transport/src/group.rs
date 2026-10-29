@@ -17,6 +17,17 @@
 //! does. Each member carries a caller-chosen *token* ([`GroupEndpoint::token`],
 //! read back on [`GroupMemberStats::token`]) so a member listed by
 //! [`SrtGroup::member_stats`] can be matched to the endpoint that created it.
+//!
+//! **Except a member libsrt strands at connect.** libsrt can write a member
+//! back to Pending after its handshake has already finished, and then never
+//! sends on it, while every listing shows it as still connecting. The I/O
+//! thread replaces such a member itself, within about a second, by closing
+//! it and connecting the same endpoint again — or, when it is the group's
+//! only member up, by connecting again first and closing it once the
+//! replacement is up, so a listing can briefly show two members with one
+//! token. Up to three times per member; past that it is closed and left to
+//! the application like a broken one. Details in `epoll_bridge.rs`,
+//! `check_stranded_members`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -239,10 +250,33 @@ impl SrtGroup {
     ///
     /// A bind failure on `local_addr` is reported as itself, not as a
     /// generic connection loss.
+    ///
+    /// **A no-op (`Ok`) while a member with the same token is already
+    /// Pending, Idle or Running on a socket that is not dead** — one
+    /// handshake per endpoint. A listing read a moment before the call can
+    /// be stale: the I/O thread may have replaced a stranded member with
+    /// that token since (see the module docs).
     pub async fn add_member(&self, ep: GroupEndpoint) -> Result<(), SrtError> {
         ep.check()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.io.send_command(IoCommand::AddGroupMember {
+            id: self.id,
+            endpoint: ep,
+            reply: reply_tx,
+        });
+        reply_rx.await.map_err(|_| SrtError::SocketFail)?
+    }
+
+    /// Test hook: make the I/O thread treat the healthy member carrying
+    /// `ep.token` as if libsrt had stranded it, so that it is replaced with
+    /// `ep` exactly as a really stranded member is — a real close and
+    /// re-add against libsrt. `InvalidParam` when no Idle or Running member
+    /// with that token is connected.
+    #[doc(hidden)]
+    pub async fn test_strand_member(&self, ep: GroupEndpoint) -> Result<(), SrtError> {
+        ep.check()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.io.send_command(IoCommand::TestStrandMember {
             id: self.id,
             endpoint: ep,
             reply: reply_tx,

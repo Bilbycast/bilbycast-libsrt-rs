@@ -17,7 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -59,7 +61,68 @@ const MAX_EPOLL_EVENTS: usize = 64;
 /// good — the last ~10 messages of a stream that ends. A read finds them
 /// (`CUDTGroup::recv` checks each member's buffer against the clock itself)
 /// and, finding nothing more, restarts the member's TSBPD thread.
-const GROUP_RECV_SWEEP: std::time::Duration = std::time::Duration::from_millis(100);
+///
+/// The sweep also recovers a readiness libsrt clears without a read:
+/// `srt_connect_group` on a group with a latched ERR clears IN and OUT with
+/// it (vendored `srtcore/api.cpp:1501-1511`), and the bridge connects into a
+/// live group whenever a member is re-added or replaced
+/// ([`check_stranded_members`]).
+const GROUP_RECV_SWEEP: Duration = Duration::from_millis(100);
+
+// ── Members libsrt strands at connect ──
+//
+// See [`check_stranded_members`] for the defect and the repair.
+
+/// How often the bridge looks at the group members it is watching. A member
+/// is watched only until it is up — about a second after it is spawned —
+/// except a backup group's receiving member, looked at once a second
+/// ([`Verdict::Masked`]); nothing runs per packet.
+const STRANDED_CHECK: Duration = Duration::from_millis(100);
+
+/// How long a member must keep reading stranded before it is replaced.
+///
+/// One reading is already final (see [`classify_watched`]); this is cheap
+/// insurance against a gap in that reasoning or a libsrt bump that changes
+/// it, and stays well inside bilbycast-edge's first supervisor tick (1 s)
+/// and its `degrade_after` (at least 5 s).
+const STRANDED_MEMBER_GRACE: Duration = Duration::from_millis(500);
+
+/// How many times one member is replaced, counting a replacement's own
+/// replacement. Past it the stranded member is only closed, and re-adding
+/// it is left to the application (bilbycast-edge's supervisor, with its
+/// backoff), so a host where the race is somehow deterministic cannot spin.
+const MAX_STRANDED_REPAIRS: u8 = 3;
+
+/// Added to a member's own connect timeout (`SRTO_CONNTIMEO`) to give the
+/// moment by which libsrt must have resolved its handshake. libsrt fails a
+/// caller member whose handshake outlives that timeout
+/// (`CRendezvousQueue::updateConnStatus` → `completeBrokenConnectionDependencies`,
+/// vendored `srtcore/queue.cpp:1025-1041`, `srtcore/core.cpp:12360-12419`),
+/// so one still unresolved after it is stuck in a way the live-state
+/// reading did not catch, and is replaced too.
+const HANDSHAKE_TTL_SLACK: Duration = Duration::from_secs(1);
+
+/// The connect timeout assumed when a member's own cannot be read: libsrt's
+/// default `SRTO_CONNTIMEO`.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often a backup-mode member whose receive state hides its send state
+/// is looked at again. See [`Verdict::Masked`].
+const MASKED_MEMBER_RECHECK: Duration = Duration::from_secs(1);
+
+/// Added to the member's latency before a member its replacement superseded
+/// is closed. See [`superseded_linger`].
+const SUPERSEDED_LINGER_SLACK: Duration = Duration::from_secs(1);
+
+/// Members libsrt stranded at connect that the bridge has acted on, process
+/// wide. Members marked stranded by [`IoCommand::TestStrandMember`] are not
+/// counted, so the number says how often libsrt really did it.
+static STRANDED_REPAIRS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`STRANDED_REPAIRS`].
+pub(crate) fn stranded_member_repairs() -> u64 {
+    STRANDED_REPAIRS.load(Ordering::Relaxed)
+}
 
 // ── Commands from Tokio tasks to the I/O thread ──
 
@@ -153,6 +216,16 @@ pub(crate) enum IoCommand {
         endpoint: GroupEndpoint,
         reply: oneshot::Sender<Result<(), SrtError>>,
     },
+    /// Test hook: treat the healthy member carrying `endpoint.token` as if
+    /// libsrt had stranded it, so [`check_stranded_members`] replaces it with
+    /// `endpoint`. Exercises the real close / re-add against libsrt; it does
+    /// not exercise libsrt's own overwrite, which only a patched libsrt can
+    /// force. `InvalidParam` when no such member is listed.
+    TestStrandMember {
+        id: SocketId,
+        endpoint: GroupEndpoint,
+        reply: oneshot::Sender<Result<(), SrtError>>,
+    },
     /// Get per-member statistics for a socket group (bonding).
     GetGroupMemberStats {
         id: SocketId,
@@ -232,10 +305,73 @@ struct SocketState {
     is_listener: bool,
     /// Whether this is a group socket.
     is_group: bool,
+    /// Whether this is a backup-mode group (`CreateGroup` only).
+    backup: bool,
     /// Last known status.
     last_status: SocketStatus,
     /// Pending connect reply (for async connect).
     connect_reply: Option<oneshot::Sender<Result<(), SrtError>>>,
+    /// Members this bridge spawned into this caller group whose handshake it
+    /// is still watching for libsrt stranding them. Empty for everything
+    /// else, including a listener's mirror group. See
+    /// [`check_stranded_members`].
+    watched: Vec<WatchedMember>,
+}
+
+/// One group member the bridge spawned (`srt_connect_group`) and is still
+/// watching. See [`check_stranded_members`].
+#[derive(Debug, Clone)]
+struct WatchedMember {
+    id: SocketId,
+    /// What it was connected with, so a replacement uses exactly the same
+    /// target, source, weight and token.
+    endpoint: GroupEndpoint,
+    /// Its socket's own state, read at the start of each check **before**
+    /// the group listing. Scratch, not history.
+    live: SocketStatus,
+    /// Not looked at before this.
+    not_before: Instant,
+    /// libsrt has connected or failed a member by now: spawn + its connect
+    /// timeout + [`HANDSHAKE_TTL_SLACK`].
+    resolve_by: Instant,
+    /// First of the current run of stranded readings.
+    stranded_since: Option<Instant>,
+    /// How many replacements stand behind this one (0 = spawned for the
+    /// application).
+    repairs: u8,
+    /// Stranded members this one replaces that were the group's only
+    /// members up ([`RepairPlan::SpawnThenClose`]). They stay in the group
+    /// until this one is up and has been for [`superseded_linger`], so the
+    /// peer's mirror group is never emptied; closed then, or as soon as this
+    /// one fails.
+    supersedes: Vec<SocketId>,
+    /// When `supersedes` is closed, once this member is up.
+    close_superseded_at: Option<Instant>,
+    /// Set by [`IoCommand::TestStrandMember`]: read as stranded.
+    forced: bool,
+}
+
+impl WatchedMember {
+    fn new(id: SocketId, endpoint: GroupEndpoint, resolve_by: Instant, now: Instant) -> Self {
+        Self {
+            id,
+            endpoint,
+            live: SocketStatus::Init,
+            not_before: now,
+            resolve_by,
+            stranded_since: None,
+            repairs: 0,
+            supersedes: Vec::new(),
+            close_superseded_at: None,
+            forced: false,
+        }
+    }
+
+    /// Watch a member just spawned into a group: its handshake has until
+    /// its own connect timeout, plus slack, to resolve.
+    fn spawned(id: SocketId, endpoint: GroupEndpoint, now: Instant) -> Self {
+        Self::new(id, endpoint, now + connect_timeout_of(id) + HANDSHAKE_TTL_SLACK, now)
+    }
 }
 
 /// Handle to the I/O thread. Clone this to send commands.
@@ -287,7 +423,10 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
     const STATE_POLL_INTERVAL: u32 = 100; // poll socket state every ~100 iterations (~1s)
     let mut sock_id_buf: Vec<SocketId> = Vec::with_capacity(32); // reusable buffer
     let mut consecutive_epoll_errors: u32 = 0;
-    let mut last_group_sweep = std::time::Instant::now();
+    let mut last_group_sweep = Instant::now();
+    let mut last_stranded_check = Instant::now();
+    // Reused for every group listing the stranded-member check reads.
+    let mut group_rows: Vec<SRT_SOCKGROUPDATA> = Vec::new();
 
     loop {
         // ── Phase 0: Park when completely idle ──────────────────────────
@@ -434,7 +573,7 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
         // Read every live group on a timer as well as on IN: libsrt can
         // leave a group's readiness unraised. See `GROUP_RECV_SWEEP`.
         if has_connected && last_group_sweep.elapsed() >= GROUP_RECV_SWEEP {
-            last_group_sweep = std::time::Instant::now();
+            last_group_sweep = Instant::now();
             sock_id_buf.clear();
             sock_id_buf.extend(
                 sockets
@@ -449,6 +588,14 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
             for id in sock_id_buf.iter().copied() {
                 handle_recv(id, &mut sockets, &mut recv_buf);
             }
+        }
+
+        // Replace members libsrt stranded at connect. Not gated on
+        // `has_connected`: the state poll can hold a group at Connecting
+        // while its members handshake. See `check_stranded_members`.
+        if last_stranded_check.elapsed() >= STRANDED_CHECK {
+            last_stranded_check = Instant::now();
+            check_stranded_members(&mut sockets, &mut group_rows, &mut sock_id_buf);
         }
 
         // Check for state changes (poll broken connections).
@@ -561,12 +708,14 @@ fn process_epoll_events(
 /// and a bonded caller never carried a packet — each connect ended at once
 /// in a send or receive `ConnectionLost` and a redial.
 ///
-/// `getStatus` is the group's real state (`SRTS_CONNECTED` while any member
-/// is Idle or Running, the pending member's state while one is connecting,
-/// `SRTS_BROKEN` when none is left). A genuine all-links-down ERR agrees
-/// with it; one that does not is ignored, and the bridge's periodic state
-/// poll still reads `getStatus` and tears the group down within about a
-/// second if it does fail later.
+/// `getStatus` is the group's real state: `SRTS_CONNECTED` while any member
+/// is Idle or Running; otherwise the live socket state of the *first*
+/// listed Pending member (vendored `srtcore/group.cpp:962-1019`) — which is
+/// `SRTS_CONNECTED` too for a member libsrt stranded at connect (see
+/// [`check_stranded_members`]); `SRTS_BROKEN` when none is left. A genuine
+/// all-links-down ERR agrees with it; one that does not is ignored, and the
+/// bridge's periodic state poll still reads `getStatus` and tears the group
+/// down within about a second if it does fail later.
 fn group_err_is_real(group: SocketId) -> bool {
     is_terminal_status(raw_state_to_status(unsafe { srt_getsockstate(group) }))
 }
@@ -747,8 +896,10 @@ fn process_command(
                 access_control: None,
                 is_listener: false,
                 is_group: false,
+                backup: false,
                 last_status: SocketStatus::Init,
                 connect_reply: None,
+                watched: Vec::new(),
             });
             state.recv_tx = Some(recv_tx);
             state.send_rx = Some(send_rx);
@@ -784,8 +935,10 @@ fn process_command(
                 access_control: None,
                 is_listener: true,
                 is_group: false,
+                backup: false,
                 last_status: SocketStatus::Init,
                 connect_reply: None,
+                watched: Vec::new(),
             });
             state.accept_tx = Some(accept_tx);
             if let Some(ac) = access_control {
@@ -835,14 +988,16 @@ fn process_command(
                 let state = SocketState {
                     recv_tx: None,
                     send_rx: None,
-                send_backlog: VecDeque::new(),
+                    send_backlog: VecDeque::new(),
                     status_tx: None,
                     accept_tx: None,
                     access_control: None,
                     is_listener: false,
                     is_group: true,
+                    backup: mode == SRT_GTYPE_BACKUP,
                     last_status: SocketStatus::Init,
                     connect_reply: None,
+                    watched: Vec::new(),
                 };
                 sockets.insert(grp, state);
                 let _ = reply.send(Ok(grp));
@@ -850,23 +1005,39 @@ fn process_command(
         }
 
         IoCommand::ConnectGroup { id, endpoints, reply } => {
-            let result = connect_group(id, &endpoints).map(|_| ());
-            if result.is_ok() {
-                add_to_epoll(
-                    epoll_id,
-                    id,
-                    SRT_EPOLL_IN as c_int | SRT_EPOLL_ERR as c_int
-                        | SRT_EPOLL_ET as c_int,
-                );
-                if let Some(state) = sockets.get_mut(&id) {
-                    update_status(state, SocketStatus::Connected);
+            let spawned = connect_group(id, &endpoints);
+            if let Some(err) = spawned.refused {
+                let _ = reply.send(Err(err));
+                return true;
+            }
+            add_to_epoll(
+                epoll_id,
+                id,
+                SRT_EPOLL_IN as c_int | SRT_EPOLL_ERR as c_int
+                    | SRT_EPOLL_ET as c_int,
+            );
+            if let Some(state) = sockets.get_mut(&id) {
+                update_status(state, SocketStatus::Connected);
+                // Only a group `CreateGroup` made is a caller group; see
+                // `check_stranded_members` for why that is required.
+                if state.is_group {
+                    let now = Instant::now();
+                    for (ep, member) in endpoints.iter().zip(&spawned.members) {
+                        if let Ok(member) = member {
+                            state.watched.push(WatchedMember::spawned(*member, *ep, now));
+                        }
+                    }
                 }
             }
-            let _ = reply.send(result);
+            let _ = reply.send(Ok(()));
         }
 
         IoCommand::AddGroupMember { id, endpoint, reply } => {
             let _ = reply.send(add_group_member(id, &endpoint, sockets));
+        }
+
+        IoCommand::TestStrandMember { id, endpoint, reply } => {
+            let _ = reply.send(force_stranded(id, endpoint, sockets));
         }
 
         IoCommand::GetGroupMemberStats { id, reply } => {
@@ -975,10 +1146,15 @@ fn is_group_id(id: SocketId) -> bool {
 /// getRcvDataSize`), so on a live group it was nearly always non-zero and
 /// each drain already ended in an `EASYNCRCV` from `srt_recvmsg2`.
 ///
-/// A group with no Idle or Running member is not read: its readiness at
-/// that point is libsrt waking pollers on a dying group, and `CUDTGroup::
-/// recv` on a group that has lost every member logs an Error-level
-/// "ABANDONING" line rather than just failing.
+/// A group libsrt does not report `SRTS_CONNECTED` is not read: its
+/// readiness at that point is libsrt waking pollers on a dying group, and
+/// `CUDTGroup::recv` on a group that has lost every member logs an
+/// Error-level "ABANDONING" line rather than just failing. That status is
+/// `CONNECTED` while some member is Idle or Running — and also while the
+/// first Pending member's own socket is connected, which is a member libsrt
+/// stranded at connect: a group whose only connected member is one of
+/// those is still read, and libsrt logs that line on each read until
+/// [`check_stranded_members`] has replaced the member (about a second).
 fn handle_recv(
     sock_id: SocketId,
     sockets: &mut HashMap<SocketId, SocketState>,
@@ -1425,21 +1601,52 @@ fn prepare_target(ep: &GroupEndpoint) -> SRT_SOCKGROUPCONFIG {
     target
 }
 
+/// What one `srt_connect_group` call left in the group.
+struct GroupConnect {
+    /// `Some` when libsrt refused the call as a whole: no member it counts
+    /// as spawned. When no member could be spawned, libsrt reports a generic
+    /// `CONNLOST`; the first per-member error code is used instead when
+    /// there is one, so a bind failure on a member's source reads as itself.
+    refused: Option<SrtError>,
+    /// Per endpoint, in order: `Ok(member id)` for a member now in the group
+    /// (its handshake continues in the background), `Err` for one that is
+    /// not.
+    members: Vec<Result<SocketId, SrtError>>,
+}
+
+impl GroupConnect {
+    /// The single member an [`add_group_member`] or a replacement spawned.
+    fn single(self) -> Result<SocketId, SrtError> {
+        match (self.members.into_iter().next(), self.refused) {
+            (Some(Ok(member)), _) => Ok(member),
+            (_, Some(err)) | (Some(Err(err)), None) => Err(err),
+            (None, None) => Err(SrtError::ConnectionLost),
+        }
+    }
+}
+
 /// Connect `endpoints` into group `grp`, one libsrt member each.
 ///
-/// The outer `Err` is libsrt refusing the call as a whole. When no member
-/// could be spawned, libsrt reports a generic `CONNLOST`; the first
-/// per-member error code is returned instead when there is one, so a bind
-/// failure on a member's source reads as itself. The inner results are per
-/// member, in order: `Ok(member id)` for a member spawned into the group (its
-/// handshake continues in the background), `Err` for one that was not.
-fn connect_group(
-    grp: SocketId,
-    endpoints: &[GroupEndpoint],
-) -> Result<Vec<Result<SocketId, SrtError>>, SrtError> {
+/// A member libsrt reports as failed but **keeps in the group** is returned
+/// as spawned. `groupConnect` reads a member's status straight after
+/// starting its handshake and, finding `SRTS_BROKEN`, lists the member
+/// Broken and reports no id for it (vendored `srtcore/api.cpp:1813-1818`) —
+/// but `CUDTSocket::getStatus` also reads BROKEN for an instant in the
+/// middle of a *successful* handshake (`m_bConnecting` already false,
+/// `m_bConnected` not yet true: `srtcore/core.cpp:5106-5118`,
+/// `srtcore/api.cpp:108-123`). Such a member ends Idle (libsrt's own write
+/// came second) or listed Broken on a connected socket, which a receive-only
+/// group never closes. Either way it is in the group, so it is reported and
+/// watched like any spawned member ([`check_stranded_members`]). Found by
+/// listing the group before and after the call.
+fn connect_group(grp: SocketId, endpoints: &[GroupEndpoint]) -> GroupConnect {
     if endpoints.is_empty() {
-        return Err(SrtError::InvalidParam);
+        return GroupConnect { refused: Some(SrtError::InvalidParam), members: Vec::new() };
     }
+
+    let mut rows = Vec::new();
+    read_group_rows(grp, &mut rows);
+    let before: Vec<SocketId> = rows.iter().map(|r| r.id).collect();
 
     let mut targets: Vec<SRT_SOCKGROUPCONFIG> = endpoints.iter().map(prepare_target).collect();
 
@@ -1451,16 +1658,16 @@ fn connect_group(
         )
     };
 
-    if ret < 0 {
-        // Read libsrt's thread-local error before anything else can touch it.
+    // Read libsrt's thread-local error before anything else can touch it.
+    let refused = (ret < 0).then(|| {
         let call_error = last_srt_error();
-        return Err(targets
+        targets
             .iter()
             .find(|t| t.errorcode != 0)
-            .map_or(call_error, |t| SrtError::from_code(t.errorcode)));
-    }
+            .map_or(call_error, |t| SrtError::from_code(t.errorcode))
+    });
 
-    let per_member: Vec<Result<SocketId, SrtError>> = targets
+    let mut members: Vec<Result<SocketId, SrtError>> = targets
         .iter()
         .map(|t| {
             if t.id >= 0 && t.errorcode == 0 {
@@ -1472,7 +1679,35 @@ fn connect_group(
             }
         })
         .collect();
-    for (ep, result) in endpoints.iter().zip(&per_member) {
+
+    // No id and no error code: libsrt found the member BROKEN after starting
+    // it, but may have kept it. Claim each new listed member once.
+    if targets.iter().any(|t| t.id < 0 && t.errorcode == 0) {
+        read_group_rows(grp, &mut rows);
+        let mut claimed: Vec<SocketId> = members.iter().filter_map(|m| m.as_ref().ok().copied()).collect();
+        for (t, member) in targets.iter().zip(members.iter_mut()) {
+            if t.id >= 0 || t.errorcode != 0 {
+                continue;
+            }
+            let kept = rows
+                .iter()
+                .find(|r| r.token == t.token && !before.contains(&r.id) && !claimed.contains(&r.id))
+                .map(|r| r.id);
+            if let Some(kept) = kept {
+                tracing::debug!(
+                    "srt-io: group {} member @{} (token {}) was reported failed by libsrt \
+                     but kept in the group; watching it",
+                    grp,
+                    kept,
+                    t.token,
+                );
+                claimed.push(kept);
+                *member = Ok(kept);
+            }
+        }
+    }
+
+    for (ep, result) in endpoints.iter().zip(&members) {
         if let Err(e) = result {
             tracing::warn!(
                 "srt-io: group {} member {} (token {}, source {:?}) was not spawned: {:?}",
@@ -1484,10 +1719,11 @@ fn connect_group(
             );
         }
     }
-    Ok(per_member)
+    GroupConnect { refused, members }
 }
 
-/// Connect one member into a live group.
+/// Connect one member into a live group, and watch it
+/// ([`check_stranded_members`]).
 ///
 /// **Refused unless the group has at least one Idle or Running member**, read
 /// here on the I/O thread right before `srt_connect_group`. libsrt's own
@@ -1499,12 +1735,22 @@ fn connect_group(
 /// Tokio side would not see the loss and redial the group whole, and the
 /// send drain (gated on `Connected`) would stall with the send channel
 /// filling behind it. `srt_getsockstate` on a group is `getStatus`, which is
-/// `SRTS_CONNECTED` exactly when some member is Idle or Running.
+/// `SRTS_CONNECTED` when some member is Idle or Running — and also when the
+/// only connected member is one libsrt stranded at connect, whose own
+/// socket is connected; the bridge replaces that member within about a
+/// second, so the add is let through and joins the repair.
 ///
 /// The remaining window — the last live member breaks between this check
 /// and the connect — is bounded by one connect timeout: the new member
 /// either connects (the group recovers in place) or fails, and the bridge's
 /// state poll then sees the group `BROKEN`.
+///
+/// **A no-op (`Ok`) while a member with the same token is already pending
+/// or live** on a socket that is not dead: one handshake per endpoint. A
+/// caller re-adds from a listing it read a moment earlier, and in between
+/// the bridge may have replaced a stranded member with that very token;
+/// spawning a second would leave two members carrying one endpoint for the
+/// life of the group.
 ///
 /// Also refused for a group the bridge no longer tracks or has already seen
 /// break, so a group whose Tokio side is gone is never revived. Makes no
@@ -1512,21 +1758,687 @@ fn connect_group(
 fn add_group_member(
     id: SocketId,
     endpoint: &GroupEndpoint,
-    sockets: &HashMap<SocketId, SocketState>,
+    sockets: &mut HashMap<SocketId, SocketState>,
 ) -> Result<(), SrtError> {
-    let tracked = sockets
-        .get(&id)
-        .is_some_and(|s| s.is_group && !is_terminal_status(s.last_status));
-    if !tracked {
+    let Some(state) = sockets
+        .get_mut(&id)
+        .filter(|s| s.is_group && !is_terminal_status(s.last_status))
+    else {
         return Err(SrtError::ConnectionLost);
-    }
+    };
     if unsafe { srt_getsockstate(id) } != SRTS_CONNECTED {
         return Err(SrtError::ConnectionLost);
     }
-    connect_group(id, std::slice::from_ref(endpoint))?
-        .pop()
-        .unwrap_or(Err(SrtError::ConnectionLost))
-        .map(|_| ())
+    let mut rows = Vec::new();
+    read_group_rows(id, &mut rows);
+    if let Some(existing) = member_in_flight(&rows, endpoint.token, &[]) {
+        tracing::debug!(
+            "srt-io: group {} already has member @{} for token {}; not adding another",
+            id,
+            existing,
+            endpoint.token,
+        );
+        return Ok(());
+    }
+    let member = connect_group(id, std::slice::from_ref(endpoint)).single()?;
+    state.watched.push(WatchedMember::spawned(member, *endpoint, Instant::now()));
+    Ok(())
+}
+
+/// Fill `buf` with group `grp`'s member listing (`srt_group_data`), reusing
+/// its allocation. Empty when the group is gone or has no member.
+fn read_group_rows(grp: SocketId, buf: &mut Vec<SRT_SOCKGROUPDATA>) {
+    if buf.len() < 8 {
+        buf.resize(8, unsafe { std::mem::zeroed() });
+    }
+    let mut count = buf.len();
+    let mut ret = unsafe { srt_group_data(grp, buf.as_mut_ptr(), &mut count) };
+    // Too small: libsrt has written the size it needs into `count`.
+    if ret < 0 && count > buf.len() {
+        buf.resize(count, unsafe { std::mem::zeroed() });
+        count = buf.len();
+        ret = unsafe { srt_group_data(grp, buf.as_mut_ptr(), &mut count) };
+    }
+    if ret < 0 {
+        count = 0;
+    }
+    buf.truncate(count);
+}
+
+/// A member's `SRTO_CONNTIMEO`, or libsrt's default when it cannot be read.
+fn connect_timeout_of(member: SocketId) -> Duration {
+    let mut ms: c_int = 0;
+    let mut len = std::mem::size_of::<c_int>() as c_int;
+    let ret = unsafe {
+        srt_getsockflag(member, SRTO_CONNTIMEO, &mut ms as *mut c_int as *mut std::ffi::c_void, &mut len)
+    };
+    if ret < 0 || ms <= 0 {
+        DEFAULT_CONNECT_TIMEOUT
+    } else {
+        Duration::from_millis(ms as u64)
+    }
+}
+
+/// How long the members a replacement superseded stay in the group once the
+/// replacement is up: the longer of the two directions' latencies on it,
+/// plus [`SUPERSEDED_LINGER_SLACK`].
+///
+/// A stranded member carries nothing, but one that data reached after it
+/// was last read, or one [`IoCommand::TestStrandMember`] marked, can hold
+/// packets the replacement never carried: those sent before the
+/// replacement was first used. Closing it breaks its peer at once,
+/// discarding what that peer still holds inside its latency window, and
+/// discards what this end holds. With no other member up nothing else holds
+/// a copy, so the latency is waited out first.
+fn superseded_linger(member: SocketId) -> Duration {
+    let latency = |opt: SRT_SOCKOPT| {
+        let mut ms: i32 = 0;
+        let mut len = std::mem::size_of::<i32>() as c_int;
+        let ret = unsafe {
+            srt_getsockflag(member, opt, &mut ms as *mut i32 as *mut std::ffi::c_void, &mut len)
+        };
+        if ret < 0 { 0 } else { ms.max(0) as u64 }
+    };
+    Duration::from_millis(latency(SRTO_RCVLATENCY).max(latency(SRTO_PEERLATENCY))) + SUPERSEDED_LINGER_SLACK
+}
+
+/// Pending, Idle or Running, on a socket that is not dead: a member that
+/// carries, or is about to carry, its endpoint.
+fn in_flight(member: MemberStatus, live: SocketStatus) -> bool {
+    matches!(member, MemberStatus::Pending | MemberStatus::Idle | MemberStatus::Running)
+        && !is_terminal_status(live)
+}
+
+/// A listed member carrying `token`, other than those in `exclude`, that is
+/// [`in_flight`].
+fn member_in_flight(rows: &[SRT_SOCKGROUPDATA], token: i32, exclude: &[SocketId]) -> Option<SocketId> {
+    rows.iter()
+        .filter(|r| r.token == token && !exclude.contains(&r.id))
+        .find(|r| {
+            let live = raw_state_to_status(unsafe { srt_getsockstate(r.id) });
+            in_flight(map_member_status(r.memberstate), live)
+        })
+        .map(|r| r.id)
+}
+
+/// What one look at a watched member found. See [`classify_watched`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Not listed, or listed Broken on a socket that is not connected:
+    /// libsrt failed it, or it was closed.
+    Gone,
+    /// Listed Broken on a connected socket: libsrt will never use it again,
+    /// and a receive-only group never closes it.
+    BrokenLive,
+    /// Its handshake finished, but libsrt will never send on it (or, listed
+    /// `CONNECTING`, never read from it either).
+    Stranded,
+    /// Up: libsrt sends on it.
+    Confirmed,
+    /// Running in a backup group, on a connected socket. libsrt lists a
+    /// member Running when *either* direction runs (`copyGroupData`,
+    /// vendored `srtcore/group.cpp:1982`), so data received on it hides its
+    /// send state; and in backup mode a keepalive turns the receive state
+    /// back to Idle when the link goes standby (`processKeepalive`,
+    /// `internalKeepalive`, `srtcore/group.cpp:4185-4233`), which lists a
+    /// stranded member Pending again. Looked at again every
+    /// [`MASKED_MEMBER_RECHECK`] until it reads Idle.
+    Masked,
+    /// Still connecting.
+    Handshaking,
+}
+
+/// Classify one watched member from its socket's **live** state, read
+/// first, and its row in the group listing read after (`None` when not
+/// listed). `forced` reads it as stranded ([`IoCommand::TestStrandMember`]);
+/// `backup` is the group's mode.
+///
+/// Stranded is `live == CONNECTED` while listed Pending, or listed with
+/// `sockstate` `CONNECTING`. libsrt's handshake writes the member Idle
+/// with `laststatus` `CONNECTED` under the group lock and only then stores
+/// the socket's `m_Status = SRTS_CONNECTED`, an atomic (vendored
+/// `srtcore/core.cpp:5177-5196`); a live `CONNECTED` read before the
+/// listing therefore guarantees the listing sees that write, unless
+/// something wrote over it afterwards. After a member is added only
+/// `groupConnect` writes Pending (`srtcore/api.cpp:1783`, `:1822`), and
+/// nothing turns Pending into anything but Broken — every promotion to
+/// Running starts from Idle. So a caller member read this way is stranded
+/// for good.
+///
+/// **Sound only for members this bridge spawned into a caller group.** On a
+/// listener's mirror group libsrt marks the socket connected *before* it
+/// writes the member Idle (`srtcore/api.cpp:796` then `:865`), so Pending on
+/// a connected socket is an ordinary instant there.
+///
+/// Running with `sockstate` `CONNECTED` in a broadcast group is left alone
+/// ([`Verdict::Confirmed`]) even though it can hide a stranded send state:
+/// data has arrived on it, so the member works for receiving, which is all a
+/// caller group that receives needs, and libsrt exposes no per-direction
+/// state to tell the two apart. A stranded sender's member receives no data
+/// and stays listed Pending.
+fn classify_watched(
+    live: SocketStatus,
+    row: Option<(MemberStatus, SocketStatus)>,
+    forced: bool,
+    backup: bool,
+) -> Verdict {
+    let Some((member, listed)) = row else {
+        return Verdict::Gone;
+    };
+    if member == MemberStatus::Broken {
+        return if live == SocketStatus::Connected { Verdict::BrokenLive } else { Verdict::Gone };
+    }
+    if live == SocketStatus::Connected
+        && (forced || member == MemberStatus::Pending || listed == SocketStatus::Connecting)
+    {
+        return Verdict::Stranded;
+    }
+    if listed == SocketStatus::Connected {
+        match member {
+            MemberStatus::Idle => return Verdict::Confirmed,
+            MemberStatus::Running if backup => return Verdict::Masked,
+            MemberStatus::Running => return Verdict::Confirmed,
+            _ => {}
+        }
+    }
+    Verdict::Handshaking
+}
+
+/// What to do with a watched member after one look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Look again at the next check.
+    Keep,
+    /// Look again no earlier than this.
+    Recheck(Instant),
+    /// Stop watching it; close every member it superseded.
+    Drop,
+    /// Close it and every member it superseded; leave re-adding to the
+    /// application.
+    Abandon,
+    /// Replace it ([`repair_plan`]).
+    Repair,
+}
+
+/// The time half of a look: grace, connect deadline, and holding a member
+/// until what it superseded has been closed. `w.supersedes` is already
+/// closed and emptied when its linger ran out on this look.
+fn next_step(w: &mut WatchedMember, verdict: Verdict, now: Instant) -> Step {
+    match verdict {
+        Verdict::Gone => Step::Drop,
+        Verdict::Stranded | Verdict::BrokenLive => {
+            let since = *w.stranded_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= STRANDED_MEMBER_GRACE {
+                Step::Repair
+            } else {
+                Step::Keep
+            }
+        }
+        Verdict::Confirmed => {
+            w.stranded_since = None;
+            if w.supersedes.is_empty() { Step::Drop } else { Step::Keep }
+        }
+        Verdict::Masked => {
+            w.stranded_since = None;
+            if w.supersedes.is_empty() {
+                Step::Recheck(now + MASKED_MEMBER_RECHECK)
+            } else {
+                Step::Keep
+            }
+        }
+        Verdict::Handshaking => {
+            w.stranded_since = None;
+            if now < w.resolve_by {
+                Step::Keep
+            } else if is_terminal_status(w.live) {
+                // libsrt failed it and should have said so by now.
+                Step::Abandon
+            } else {
+                // Past its connect timeout and still neither up nor failed.
+                Step::Repair
+            }
+        }
+    }
+}
+
+/// How a member found stranded is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairPlan {
+    /// Another member for the same endpoint is in flight and still watched
+    /// (re-added by the application meanwhile): it supersedes this one.
+    JoinSibling(SocketId),
+    /// Close it now: a member for the same endpoint is already up, or this
+    /// one has been replaced [`MAX_STRANDED_REPAIRS`] times.
+    CloseNow,
+    /// Close it, then connect the same endpoint again: another member of
+    /// the group is up, so the peer's mirror group keeps a member.
+    CloseThenSpawn,
+    /// Connect the same endpoint again, and close this one only once that is
+    /// up: it is the group's only member that is up.
+    SpawnThenClose,
+}
+
+/// `sibling`: another listed, [`in_flight`] member carrying the same token,
+/// and whether the bridge is still watching it. `others_up`: another member
+/// of the group, carrying any token, is Idle or Running on a connected
+/// socket.
+///
+/// **Close first when another member is up, make before break only when
+/// none is.** Closing a connected member sends its peer a shutdown, and a
+/// listener's mirror group that loses its last member fails whole — the
+/// listener drops the session, which is the redial this repair exists to
+/// avoid (and an emptied caller group restarts its sequence numbers). So
+/// when the stranded member is the only one up, it stays until its
+/// replacement is up. But overlapping the two is not free either: the peer
+/// lists both, for that while, as live members of the session, and a
+/// bilbycast-edge listener measures redundancy against the most live
+/// members a session has had — it would count the overlap as one member
+/// more than the bond has, and report one missing for good once the
+/// stranded member left. With another member up, closing first costs
+/// nothing: a stranded member carries nothing, and the peer only sees the
+/// ordinary short dip of a member re-added from a new source port.
+fn repair_plan(repairs: u8, sibling: Option<(SocketId, bool)>, others_up: bool) -> RepairPlan {
+    match sibling {
+        Some((id, true)) => RepairPlan::JoinSibling(id),
+        Some((_, false)) => RepairPlan::CloseNow,
+        None if repairs >= MAX_STRANDED_REPAIRS => RepairPlan::CloseNow,
+        None if others_up => RepairPlan::CloseThenSpawn,
+        None => RepairPlan::SpawnThenClose,
+    }
+}
+
+/// Whether a listed member, other than those in `exclude`, is Idle or
+/// Running on a connected socket.
+fn other_member_up(rows: &[SRT_SOCKGROUPDATA], exclude: &[SocketId]) -> bool {
+    rows.iter().filter(|r| !exclude.contains(&r.id)).any(|r| {
+        matches!(map_member_status(r.memberstate), MemberStatus::Idle | MemberStatus::Running)
+            && unsafe { srt_getsockstate(r.id) } == SRTS_CONNECTED
+    })
+}
+
+/// Close group members the bridge has given up on. Closing a member removes
+/// it from its group at once (`CUDTUnited::close`, vendored
+/// `srtcore/api.cpp:2229-2237`) and does not block: libsrt makes every
+/// member non-blocking (`srtcore/api.cpp:1689`). An id libsrt has already
+/// disposed of is a harmless miss.
+fn close_members(ids: &[SocketId]) {
+    for id in ids {
+        unsafe { srt_close(*id) };
+    }
+}
+
+/// Replace group members that libsrt stranded at connect: handshake
+/// finished, socket connected, but listed `Pending` for good, so libsrt
+/// never sends on them.
+///
+/// # The defect (libsrt v1.5.7, vendored)
+///
+/// `groupConnect` starts each member's handshake (`connectIn`), reads the
+/// member's status, then writes the member `Pending` under the group lock
+/// (`srtcore/api.cpp:1712`, `:1747-1751`, `:1822`). The handshake runs on
+/// libsrt's receive thread, and on a loopback or LAN path, or a loaded
+/// host, it can finish first: `postConnect` writes the member Idle
+/// (`srtcore/core.cpp:5185-5188`), and `groupConnect`'s later write puts it
+/// back to Pending. Nothing ever promotes Pending again, and libsrt never
+/// sends on a Pending member (`srtcore/group.cpp:1323-1335`). Two shapes:
+/// the listing shows Pending with `sockstate` `CONNECTED` (the handshake
+/// finished before the status read), or Pending with `CONNECTING` while
+/// the socket is in fact connected (it finished between the read and the
+/// write) — group receive skips a `CONNECTING` member too
+/// (`srtcore/group.cpp:2108-2132`), so that one carries nothing either way.
+///
+/// The cost was silent. In a group with another live member, the link
+/// carried nothing while every listing called it "handshake in progress",
+/// so bilbycast-edge's supervisor waited on it for ever: redundancy lost
+/// with no event but a `srt_bond_member_down` that never resolved. As the
+/// group's only connected member, `getStatus` read the group `CONNECTED`
+/// through the member's socket, the first send failed with an ERR the
+/// bridge rightly ignores, and every later send would-blocked: a bonded
+/// output stalled for good with status Connected. It was the residual
+/// intermittent failure of `tests/group_members.rs`.
+///
+/// # The repair
+///
+/// Every member this bridge spawns into a caller group (`ConnectGroup`,
+/// `AddGroupMember`, and its own replacements) is watched until it is up.
+/// Every [`STRANDED_CHECK`] each watched member's live socket state is read,
+/// then the group listing, and [`classify_watched`] judges it. One read
+/// stranded for [`STRANDED_MEMBER_GRACE`] is replaced by connecting the
+/// same [`GroupEndpoint`] again. While another member of the group is up,
+/// the stranded member is closed first; while it is the only one up, it
+/// stays until its replacement is up and has been for
+/// [`superseded_linger`], and is closed then, or as soon as the replacement
+/// fails — closing it first would empty the peer's mirror group, which then
+/// fails whole: the redial this exists to avoid. [`repair_plan`] has why the
+/// two are not simply always overlapped. A member also reads stranded once
+/// its own connect timeout plus [`HANDSHAKE_TTL_SLACK`] has passed with it
+/// still unresolved, whatever the reason, and one listed Broken on a
+/// connected socket (see [`connect_group`]) is replaced the same way.
+///
+/// A replacement is watched like any member, at most
+/// [`MAX_STRANDED_REPAIRS`] deep; past that the stranded member is closed
+/// and re-adding it is left to the application. Everything runs on this
+/// thread, as do member listings and `AddGroupMember`, so an application
+/// listing always shows the endpoint as the stranded member or its pending
+/// replacement, never absent, and an application that re-adds anyway is
+/// absorbed by [`add_group_member`]'s one-handshake-per-token rule.
+///
+/// Only caller groups are watched: see [`classify_watched`] for why the
+/// test is unsound on a listener's mirror group, which libsrt does not
+/// strand anyway. Logged at warn; no event.
+fn check_stranded_members(
+    sockets: &mut HashMap<SocketId, SocketState>,
+    rows: &mut Vec<SRT_SOCKGROUPDATA>,
+    groups: &mut Vec<SocketId>,
+) {
+    groups.clear();
+    groups.extend(
+        sockets
+            .iter()
+            .filter(|(_, s)| {
+                !s.watched.is_empty()
+                    && s.last_status != SocketStatus::Init
+                    && !is_terminal_status(s.last_status)
+            })
+            .map(|(id, _)| *id),
+    );
+    if groups.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    for grp in groups.iter().copied() {
+        check_group(grp, sockets, rows, now);
+    }
+}
+
+fn check_group(
+    grp: SocketId,
+    sockets: &mut HashMap<SocketId, SocketState>,
+    rows: &mut Vec<SRT_SOCKGROUPDATA>,
+    now: Instant,
+) {
+    let Some(state) = sockets.get_mut(&grp) else {
+        return;
+    };
+    if !state.watched.iter().any(|w| w.not_before <= now) {
+        return;
+    }
+    let backup = state.backup;
+    let mut watched = std::mem::take(&mut state.watched);
+
+    // Live state first, then the listing: see `classify_watched`.
+    for w in watched.iter_mut() {
+        w.live = raw_state_to_status(unsafe { srt_getsockstate(w.id) });
+    }
+    read_group_rows(grp, rows);
+
+    let mut spawned: Vec<WatchedMember> = Vec::new();
+    let mut idx = 0;
+    while idx < watched.len() {
+        if watched[idx].not_before > now {
+            idx += 1;
+            continue;
+        }
+        let row = rows
+            .iter()
+            .find(|r| r.id == watched[idx].id)
+            .map(|r| (map_member_status(r.memberstate), raw_state_to_status(r.sockstate)));
+        let w = &mut watched[idx];
+        let verdict = classify_watched(w.live, row, w.forced, backup);
+
+        if matches!(verdict, Verdict::Confirmed | Verdict::Masked) && !w.supersedes.is_empty() {
+            let at = *w.close_superseded_at.get_or_insert_with(|| now + superseded_linger(w.id));
+            if now >= at {
+                tracing::debug!(
+                    "srt-io: group {} member @{} (token {}) is up; closing the stranded {:?} it replaced",
+                    grp,
+                    w.id,
+                    w.endpoint.token,
+                    w.supersedes,
+                );
+                close_members(&w.supersedes);
+                w.supersedes.clear();
+            }
+        }
+
+        match next_step(w, verdict, now) {
+            Step::Keep => idx += 1,
+            Step::Recheck(at) => {
+                w.not_before = at;
+                idx += 1;
+            }
+            Step::Drop => {
+                let w = watched.swap_remove(idx);
+                if !w.supersedes.is_empty() {
+                    tracing::warn!(
+                        "srt-io: group {} member @{} (token {}, peer {}, source {:?}), which replaced \
+                         the stranded {:?}, is gone; closed those too, leaving the member for the \
+                         application to re-add",
+                        grp,
+                        w.id,
+                        w.endpoint.token,
+                        w.endpoint.addr,
+                        w.endpoint.local_addr,
+                        w.supersedes,
+                    );
+                    close_members(&w.supersedes);
+                }
+            }
+            Step::Abandon => {
+                let w = watched.swap_remove(idx);
+                tracing::warn!(
+                    "srt-io: group {} member @{} (token {}, peer {}, source {:?}) is still listed \
+                     unresolved (member, socket: {:?}) past its connect timeout, though its socket \
+                     is {:?}; closed it, leaving the member for the application to re-add",
+                    grp,
+                    w.id,
+                    w.endpoint.token,
+                    w.endpoint.addr,
+                    w.endpoint.local_addr,
+                    row,
+                    w.live,
+                );
+                close_members(&[w.id]);
+                close_members(&w.supersedes);
+            }
+            Step::Repair => {
+                let w = watched.swap_remove(idx);
+                repair_stranded(grp, w, verdict, rows, &mut watched, &mut spawned, now);
+            }
+        }
+    }
+    watched.extend(spawned);
+
+    let Some(state) = sockets.get_mut(&grp) else {
+        return;
+    };
+    state.watched = watched;
+    // The state poll can hold a fresh group at Connecting while its members
+    // handshake, and in a loop with nothing else connected its next look is
+    // about 10 s away; take the group back to Connected as soon as libsrt
+    // says so.
+    if state.last_status == SocketStatus::Connecting
+        && unsafe { srt_getsockstate(grp) } == SRTS_CONNECTED
+    {
+        update_status(state, SocketStatus::Connected);
+    }
+}
+
+/// Act on a watched member [`next_step`] chose to replace. `watched` holds
+/// the group's other watched members; a new replacement goes to `spawned`.
+fn repair_stranded(
+    grp: SocketId,
+    w: WatchedMember,
+    verdict: Verdict,
+    rows: &[SRT_SOCKGROUPDATA],
+    watched: &mut [WatchedMember],
+    spawned: &mut Vec<WatchedMember>,
+    now: Instant,
+) {
+    if !w.forced {
+        STRANDED_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    }
+    let what = match verdict {
+        Verdict::BrokenLive => "is listed broken by libsrt on a connected socket",
+        Verdict::Handshaking => "is still connecting after its connect timeout",
+        _ if w.forced => "was marked stranded by the test hook",
+        _ => "finished its handshake but libsrt left it pending",
+    };
+    let token = w.endpoint.token;
+    let mut chain = w.supersedes.clone();
+    chain.push(w.id);
+    // `rows` was read before this pass, so a replacement spawned earlier in
+    // it is not listed there: look for one of those first.
+    let sibling = spawned
+        .iter()
+        .find(|e| e.endpoint.token == token)
+        .map(|e| (e.id, true))
+        .or_else(|| {
+            member_in_flight(rows, token, &chain)
+                .map(|id| (id, watched.iter().chain(spawned.iter()).any(|e| e.id == id)))
+        });
+
+    let others_up = other_member_up(rows, &chain);
+    match repair_plan(w.repairs, sibling, others_up) {
+        RepairPlan::JoinSibling(other) => {
+            tracing::warn!(
+                "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would never \
+                 carry a packet; @{} already re-connects that endpoint and will replace it",
+                grp,
+                w.id,
+                token,
+                w.endpoint.addr,
+                w.endpoint.local_addr,
+                what,
+                other,
+            );
+            // Closed now while another member is up, else handed to the
+            // sibling to close once it is up: see `repair_plan`.
+            match watched.iter_mut().chain(spawned.iter_mut()).find(|e| e.id == other) {
+                Some(e) if !others_up => e.supersedes.extend(chain),
+                _ => close_members(&chain),
+            }
+        }
+        RepairPlan::CloseNow => {
+            let why = if sibling.is_some() {
+                "another member already carries that endpoint".to_string()
+            } else {
+                format!("repair limit {MAX_STRANDED_REPAIRS} reached; left for the application to re-add")
+            };
+            tracing::warn!(
+                "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would never \
+                 carry a packet; closed it ({})",
+                grp,
+                w.id,
+                token,
+                w.endpoint.addr,
+                w.endpoint.local_addr,
+                what,
+                why,
+            );
+            close_members(&chain);
+        }
+        plan @ (RepairPlan::CloseThenSpawn | RepairPlan::SpawnThenClose) => {
+            let close_first = plan == RepairPlan::CloseThenSpawn;
+            if close_first {
+                close_members(&chain);
+            }
+            match connect_group(grp, std::slice::from_ref(&w.endpoint)).single() {
+                Ok(new) => {
+                    let order = if close_first {
+                        format!("closed it and re-connected the same endpoint as @{new}")
+                    } else {
+                        format!(
+                            "re-connected the same endpoint as @{new}, and will close @{} once that \
+                             is up, as it is the only member up",
+                            w.id
+                        )
+                    };
+                    tracing::warn!(
+                        "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would \
+                         never carry a packet; {} (repair {}/{})",
+                        grp,
+                        w.id,
+                        token,
+                        w.endpoint.addr,
+                        w.endpoint.local_addr,
+                        what,
+                        order,
+                        w.repairs + 1,
+                        MAX_STRANDED_REPAIRS,
+                    );
+                    let mut next = WatchedMember::spawned(new, w.endpoint, now);
+                    next.repairs = w.repairs + 1;
+                    if !close_first {
+                        next.supersedes = chain;
+                    }
+                    spawned.push(next);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "srt-io: group {} member @{} (token {}, peer {}, source {:?}) {}, so it would \
+                         never carry a packet; re-connecting the same endpoint failed ({:?}), so closed \
+                         it, leaving the member for the application to re-add",
+                        grp,
+                        w.id,
+                        token,
+                        w.endpoint.addr,
+                        w.endpoint.local_addr,
+                        what,
+                        err,
+                    );
+                    if !close_first {
+                        close_members(&chain);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`IoCommand::TestStrandMember`]: mark the healthy member carrying
+/// `endpoint.token` stranded.
+fn force_stranded(
+    id: SocketId,
+    endpoint: GroupEndpoint,
+    sockets: &mut HashMap<SocketId, SocketState>,
+) -> Result<(), SrtError> {
+    let Some(state) = sockets
+        .get_mut(&id)
+        .filter(|s| s.is_group && !is_terminal_status(s.last_status))
+    else {
+        return Err(SrtError::ConnectionLost);
+    };
+    let mut rows = Vec::new();
+    read_group_rows(id, &mut rows);
+    let superseded: Vec<SocketId> =
+        state.watched.iter().flat_map(|w| w.supersedes.iter().copied()).collect();
+    let member = rows
+        .iter()
+        .find(|r| {
+            r.token == endpoint.token
+                && !superseded.contains(&r.id)
+                && matches!(
+                    map_member_status(r.memberstate),
+                    MemberStatus::Idle | MemberStatus::Running
+                )
+                && unsafe { srt_getsockstate(r.id) } == SRTS_CONNECTED
+        })
+        .map(|r| r.id)
+        .ok_or(SrtError::InvalidParam)?;
+    let now = Instant::now();
+    match state.watched.iter_mut().find(|w| w.id == member) {
+        Some(w) => {
+            w.forced = true;
+            w.not_before = now;
+        }
+        None => {
+            let mut w = WatchedMember::spawned(member, endpoint, now);
+            w.forced = true;
+            state.watched.push(w);
+        }
+    }
+    Ok(())
 }
 
 fn get_socket_stats(sock: SocketId) -> Result<SrtStats, SrtError> {
@@ -1984,10 +2896,10 @@ mod tests {
     /// revived by a re-add.
     #[test]
     fn add_member_to_an_untracked_group_is_refused() {
-        let sockets: HashMap<SocketId, SocketState> = HashMap::new();
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
         let ep = GroupEndpoint::new(sa("127.0.0.1:9"), 0);
         assert_eq!(
-            add_group_member(0x4000_0001, &ep, &sockets),
+            add_group_member(0x4000_0001, &ep, &mut sockets),
             Err(SrtError::ConnectionLost)
         );
     }
@@ -2123,6 +3035,234 @@ mod tests {
             .cloned()
             .collect();
         assert!(hits.is_empty(), "closing a never-connected group logged: {hits:?}");
+        unsafe { srt_epoll_release(epoll_id) };
+    }
+
+    // ── Stranded members ───────────────────────────────────────────────
+
+    use MemberStatus as M;
+    use SocketStatus as S;
+
+    fn watched(now: Instant) -> WatchedMember {
+        WatchedMember::new(
+            0x1234,
+            GroupEndpoint::new(sa("127.0.0.1:9000"), 1),
+            now + Duration::from_secs(4),
+            now,
+        )
+    }
+
+    /// The predicate, both libsrt overwrite shapes, and what is deliberately
+    /// left alone. `live` is the socket's own state, `row` the listing.
+    #[test]
+    fn classify_watched_matrix() {
+        /// live, listed (member, sockstate), forced, backup, verdict, why.
+        type Case = (S, Option<(M, S)>, bool, bool, Verdict, &'static str);
+        let cases: &[Case] = &[
+            (S::Connected, Some((M::Pending, S::Connected)), false, false, Verdict::Stranded,
+             "handshake done before groupConnect read the status"),
+            (S::Connected, Some((M::Pending, S::Connecting)), false, false, Verdict::Stranded,
+             "handshake done between the read and the write"),
+            (S::Connected, Some((M::Running, S::Connecting)), false, false, Verdict::Stranded,
+             "the second shape with data received: group recv still skips it"),
+            (S::Connected, Some((M::Running, S::Connected)), false, false, Verdict::Confirmed,
+             "broadcast Running: receiving works, send state unknowable — left alone"),
+            (S::Connected, Some((M::Running, S::Connected)), false, true, Verdict::Masked,
+             "backup Running: a keepalive can list it Pending again"),
+            (S::Connected, Some((M::Idle, S::Connected)), false, false, Verdict::Confirmed,
+             "Idle proves the send state is Idle"),
+            (S::Connected, Some((M::Idle, S::Connected)), false, true, Verdict::Confirmed,
+             "Idle in backup too"),
+            (S::Connecting, Some((M::Pending, S::Connecting)), false, false, Verdict::Handshaking,
+             "an ordinary handshake"),
+            (S::Opened, Some((M::Pending, S::Connecting)), false, false, Verdict::Handshaking,
+             "not even started"),
+            (S::Broken, Some((M::Pending, S::Connecting)), false, false, Verdict::Handshaking,
+             "failing: libsrt is about to list it Broken"),
+            (S::Connected, Some((M::Broken, S::Broken)), false, false, Verdict::BrokenLive,
+             "listed Broken on a connected socket"),
+            (S::Broken, Some((M::Broken, S::Broken)), false, false, Verdict::Gone,
+             "an ordinary failure"),
+            (S::NonExist, Some((M::Broken, S::Connected)), false, false, Verdict::Gone,
+             "an ordinary loss of a used link"),
+            (S::Connected, None, false, false, Verdict::Gone, "no longer listed"),
+            (S::NonExist, None, false, false, Verdict::Gone, "closed"),
+            (S::Connected, Some((M::Idle, S::Connected)), true, false, Verdict::Stranded,
+             "forced by the test hook"),
+            (S::Connected, Some((M::Running, S::Connected)), true, true, Verdict::Stranded,
+             "forced, backup"),
+            (S::Broken, Some((M::Idle, S::Connected)), true, false, Verdict::Confirmed,
+             "forced but no longer connected: nothing to replace"),
+        ];
+        for (live, row, forced, backup, want, why) in cases {
+            assert_eq!(
+                classify_watched(*live, *row, *forced, *backup),
+                *want,
+                "live {live:?}, row {row:?}, forced {forced}, backup {backup}: {why}"
+            );
+        }
+    }
+
+    /// One stranded reading is not acted on until it has persisted for the
+    /// grace period; any other reading restarts the clock.
+    #[test]
+    fn a_stranded_member_is_repaired_only_after_the_grace() {
+        let t0 = Instant::now();
+        let mut w = watched(t0);
+        w.live = S::Connected;
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0 + Duration::from_millis(499)), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0 + STRANDED_MEMBER_GRACE), Step::Repair);
+
+        let mut w = watched(t0);
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0), Step::Keep);
+        assert_eq!(
+            next_step(&mut w, Verdict::Handshaking, t0 + Duration::from_millis(200)),
+            Step::Keep
+        );
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0 + Duration::from_millis(300)), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0 + Duration::from_millis(799)), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::Stranded, t0 + Duration::from_millis(800)), Step::Repair);
+
+        let mut w = watched(t0);
+        assert_eq!(next_step(&mut w, Verdict::BrokenLive, t0), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::BrokenLive, t0 + STRANDED_MEMBER_GRACE), Step::Repair);
+    }
+
+    /// A member still unresolved past its connect deadline is not waited on
+    /// for ever: replaced if its socket is alive, closed if it is dead.
+    #[test]
+    fn a_member_unresolved_past_its_connect_timeout_is_not_waited_on() {
+        let t0 = Instant::now();
+        let mut w = watched(t0);
+        let deadline = w.resolve_by;
+        w.live = S::Connecting;
+        assert_eq!(
+            next_step(&mut w, Verdict::Handshaking, deadline - Duration::from_millis(1)),
+            Step::Keep
+        );
+        assert_eq!(next_step(&mut w, Verdict::Handshaking, deadline), Step::Repair);
+        w.live = S::Broken;
+        assert_eq!(next_step(&mut w, Verdict::Handshaking, deadline), Step::Abandon);
+    }
+
+    /// A member that is up stops being watched only once what it superseded
+    /// has been closed; a backup member hiding its send state is looked at
+    /// again, slowly, until it reads Idle.
+    #[test]
+    fn up_members_hold_until_their_predecessors_are_closed() {
+        let t0 = Instant::now();
+        let mut w = watched(t0);
+        assert_eq!(next_step(&mut w, Verdict::Confirmed, t0), Step::Drop);
+        assert_eq!(next_step(&mut w, Verdict::Masked, t0), Step::Recheck(t0 + MASKED_MEMBER_RECHECK));
+        assert_eq!(next_step(&mut w, Verdict::Gone, t0), Step::Drop);
+
+        w.supersedes.push(0x99);
+        assert_eq!(next_step(&mut w, Verdict::Confirmed, t0), Step::Keep);
+        assert_eq!(next_step(&mut w, Verdict::Masked, t0), Step::Keep);
+        // Gone with predecessors: they are closed with it (by the caller).
+        assert_eq!(next_step(&mut w, Verdict::Gone, t0), Step::Drop);
+    }
+
+    /// One handshake per endpoint, and a bounded chain of replacements.
+    #[test]
+    fn repair_plan_joins_a_sibling_and_stops_at_the_cap() {
+        for others_up in [false, true] {
+            assert_eq!(repair_plan(MAX_STRANDED_REPAIRS, None, others_up), RepairPlan::CloseNow);
+            assert_eq!(repair_plan(0, Some((7, true)), others_up), RepairPlan::JoinSibling(7));
+            assert_eq!(repair_plan(0, Some((7, false)), others_up), RepairPlan::CloseNow);
+            assert_eq!(
+                repair_plan(MAX_STRANDED_REPAIRS, Some((7, true)), others_up),
+                RepairPlan::JoinSibling(7)
+            );
+        }
+    }
+
+    /// Close first while another member is up: the peer keeps a member, and
+    /// sees no more live members than the bond has. Make before break only
+    /// for the group's only member that is up, whose closing would empty the
+    /// peer's mirror group and fail it whole.
+    #[test]
+    fn repair_plan_breaks_first_unless_it_is_the_only_member_up() {
+        assert_eq!(repair_plan(0, None, true), RepairPlan::CloseThenSpawn);
+        assert_eq!(repair_plan(MAX_STRANDED_REPAIRS - 1, None, true), RepairPlan::CloseThenSpawn);
+        assert_eq!(repair_plan(0, None, false), RepairPlan::SpawnThenClose);
+        assert_eq!(repair_plan(MAX_STRANDED_REPAIRS - 1, None, false), RepairPlan::SpawnThenClose);
+    }
+
+    /// What `add_group_member` treats as an endpoint already being carried.
+    #[test]
+    fn in_flight_is_pending_or_live_on_a_socket_that_is_not_dead() {
+        for m in [M::Pending, M::Idle, M::Running] {
+            assert!(in_flight(m, S::Connected), "{m:?}");
+            assert!(in_flight(m, S::Connecting), "{m:?}");
+            assert!(!in_flight(m, S::Broken), "{m:?} on a broken socket");
+            assert!(!in_flight(m, S::NonExist), "{m:?} on a closed socket");
+        }
+        assert!(!in_flight(M::Broken, S::Connected));
+    }
+
+    /// Only caller groups are watched: the predicate is unsound on a
+    /// listener's mirror group (libsrt marks the socket connected before it
+    /// writes the member Idle there), and nothing is watched before a group
+    /// has members.
+    #[test]
+    fn only_members_the_bridge_spawns_are_watched() {
+        libsrt_sys::ensure_initialized();
+        let epoll_id = unsafe { srt_epoll_create() };
+        assert!(epoll_id >= 0, "srt_epoll_create failed");
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(
+            IoCommand::CreateGroup {
+                mode: SRT_GTYPE_BACKUP,
+                config: {
+                    let mut c = SrtConfig::default();
+                    c.live_defaults();
+                    c
+                },
+                reply: tx,
+            },
+            epoll_id,
+            &mut sockets,
+        );
+        let grp = rx.try_recv().expect("no reply").expect("srt_create_group failed");
+        assert!(sockets[&grp].watched.is_empty());
+        assert!(sockets[&grp].backup, "a backup group must read as one");
+
+        let mut rows = Vec::new();
+        read_group_rows(grp, &mut rows);
+        assert!(rows.is_empty(), "a memberless group listed {} members", rows.len());
+
+        // An accepted socket (or a listener's mirror group) is registered
+        // this way: never watched.
+        let sock = unsafe { srt_create_socket() };
+        assert!(sock >= 0, "srt_create_socket failed");
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (_send_tx, send_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = watch::channel(SocketStatus::Init);
+        process_command(
+            IoCommand::RegisterSocket { id: sock, recv_tx, send_rx, status_tx },
+            epoll_id,
+            &mut sockets,
+        );
+        assert!(sockets[&sock].watched.is_empty());
+        assert!(!sockets[&sock].backup);
+
+        // Nothing to mark on a group without members.
+        assert_eq!(
+            force_stranded(grp, GroupEndpoint::new(sa("127.0.0.1:9"), 0), &mut sockets),
+            Err(SrtError::InvalidParam)
+        );
+        assert!(sockets[&grp].watched.is_empty());
+
+        // Never subscribed to the epoll (only connects and accepts are), so
+        // close it directly: unsubscribing it makes libsrt log an internal
+        // error.
+        sockets.remove(&sock);
+        unsafe { srt_close(sock) };
+        close_and_release(epoll_id, grp, &mut sockets);
         unsafe { srt_epoll_release(epoll_id) };
     }
 

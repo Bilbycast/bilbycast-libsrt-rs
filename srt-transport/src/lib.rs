@@ -47,7 +47,9 @@
 //!
 //! libsrt drops a broken member and does not bring it back on its own;
 //! [`SrtGroup::add_member`] re-adds one (same source, weight and token, see
-//! [`GroupEndpoint`]) while the group still has a live member.
+//! [`GroupEndpoint`]) while the group still has a live member. The one
+//! exception is a member libsrt strands at connect (handshake done, listed
+//! Pending for good): the I/O thread replaces that one itself.
 
 pub(crate) mod epoll_bridge;
 pub(crate) mod error;
@@ -72,3 +74,12 @@ pub use group::{
 };
 pub use srt_protocol::config::{MemberStatus, SocketStatus};
 pub use srt_protocol::access_control::{AccessControl, AccessControlFn, HandshakeInfo};
+
+/// How many group members libsrt stranded at connect (handshake finished,
+/// listed Pending for good) the I/O thread has replaced or closed in this
+/// process. Diagnostics and tests; members marked by
+/// [`SrtGroup::test_strand_member`] are not counted.
+#[doc(hidden)]
+pub fn stranded_member_repairs() -> u64 {
+    epoll_bridge::stranded_member_repairs()
+}

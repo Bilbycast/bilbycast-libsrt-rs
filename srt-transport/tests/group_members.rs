@@ -28,6 +28,16 @@
 //! tail, so they cover both (`epoll_bridge.rs`, `handle_recv` and
 //! `GROUP_RECV_SWEEP`).
 //!
+//! And libsrt can strand a member at connect: its handshake finishes before
+//! `srt_connect_group` writes it Pending, the write wins, and the member
+//! never carries a packet while every listing calls it connecting. That was
+//! the residual intermittent failure here, on a loaded host. The bridge
+//! replaces such a member (`epoll_bridge.rs`, `check_stranded_members`); the
+//! `a_stranded_…` / `…_replaced_…` cases drive that replacement through a
+//! test hook that marks a healthy member stranded, against real libsrt.
+//! The overwrite itself needs a patched libsrt to force; the commit that
+//! added this records that run.
+//!
 //! # Why `harness = false`
 //!
 //! Same reason as `listener_access_control.rs`, whose module docs carry the
@@ -110,6 +120,29 @@ fn main() {
         passed += 1;
     }
 
+    rt.block_on(a_stranded_member_is_replaced_and_media_never_gaps(false));
+    println!("test a_stranded_member_is_replaced_and_media_never_gaps ... ok");
+    passed += 1;
+
+    rt.block_on(a_stranded_member_is_replaced_and_media_never_gaps(true));
+    println!("test a_stranded_member_with_a_fixed_source_port_is_replaced_and_media_never_gaps ... ok");
+    passed += 1;
+
+    rt.block_on(a_groups_only_connected_member_is_replaced_in_place());
+    println!("test a_groups_only_connected_member_is_replaced_in_place ... ok");
+    passed += 1;
+
+    #[cfg(target_os = "linux")]
+    {
+        rt.block_on(a_stranded_backup_standby_is_replaced());
+        println!("test a_stranded_backup_standby_is_replaced ... ok");
+        passed += 1;
+    }
+
+    // How often libsrt really stranded a member during this run (the test
+    // hook's are not counted). A loop over this binary sums it to show the
+    // race happened and healed rather than never happening.
+    println!("stranded member repairs: {}", srt_transport::stranded_member_repairs());
     println!("\ntest result: ok. {passed} passed; 0 failed");
     let _ = std::io::stdout().flush();
 
@@ -227,12 +260,16 @@ fn token_healthy(members: &[GroupMemberStats], token: i32) -> bool {
 
 /// Poll until `cond` holds on the caller group's members, or panic with
 /// `what` and the last listing.
-async fn wait_caller(group: &SrtGroup, what: &str, cond: impl Fn(&[GroupMemberStats]) -> bool) {
+async fn wait_caller(
+    group: &SrtGroup,
+    what: &str,
+    cond: impl Fn(&[GroupMemberStats]) -> bool,
+) -> Vec<GroupMemberStats> {
     let start = Instant::now();
     loop {
         let members = group.member_stats().await;
         if cond(&members) {
-            return;
+            return members;
         }
         if start.elapsed() > DEADLINE {
             panic!("caller group never reached: {what}; members: {members:#?}");
@@ -241,12 +278,16 @@ async fn wait_caller(group: &SrtGroup, what: &str, cond: impl Fn(&[GroupMemberSt
     }
 }
 
-async fn wait_listener(sock: &SrtSocket, what: &str, cond: impl Fn(&[GroupMemberStats]) -> bool) {
+async fn wait_listener(
+    sock: &SrtSocket,
+    what: &str,
+    cond: impl Fn(&[GroupMemberStats]) -> bool,
+) -> Vec<GroupMemberStats> {
     let start = Instant::now();
     loop {
         let members = sock.member_stats().await;
         if cond(&members) {
-            return;
+            return members;
         }
         if start.elapsed() > DEADLINE {
             panic!("listener group never reached: {what}; members: {members:#?}");
@@ -356,11 +397,14 @@ async fn a_dark_first_member_stalls_neither_receiver() {
     let group = connect_group(GroupMode::Broadcast, &[GroupEndpoint::new(hole.addr, 0)]).await;
     let accepted = Arc::new(accept(&mut listener).await);
     wait_caller(&group, "member 0 healthy", |ms| token_healthy(ms, 0)).await;
-    wait_listener(&accepted, "the first member", |ms| {
-        ms.iter().filter(|m| healthy(m)).count() == 1
+    // Exactly one member listed, not just one healthy: had the bridge
+    // replaced a stranded first member, its predecessor would stay listed
+    // (Broken, and first) until libsrt collects it.
+    let alone = wait_listener(&accepted, "the first member alone", |ms| {
+        ms.len() == 1 && healthy(&ms[0])
     })
     .await;
-    let dark_on_listener = accepted.member_stats().await[0].id;
+    let dark_on_listener = alone[0].id;
 
     group.add_member(GroupEndpoint::new(target, 1)).await.expect("add the direct member");
     wait_caller(&group, "both members healthy", |ms| {
@@ -586,15 +630,14 @@ async fn losing_every_member_still_tears_the_group_down() {
 
     hole_a.set_dropping(true);
     hole_b.set_dropping(true);
-    let start = Instant::now();
-    loop {
-        let members = group.member_stats().await;
-        if !members.iter().any(healthy) {
-            break;
-        }
-        assert!(start.elapsed() < DEADLINE, "members never broke: {members:#?}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // Every listed member Broken, not just none Idle or Running: a member
+    // the bridge replaced for being stranded stays listed, Pending on a
+    // connected socket, until its replacement has been up a moment, and
+    // libsrt reads the group connected through it until its own link fails.
+    wait_caller(&group, "every member broken", |ms| {
+        ms.iter().all(|m| m.member_status == MemberStatus::Broken)
+    })
+    .await;
     assert_eq!(
         group.add_member(a).await,
         Err(SrtError::ConnectionLost),
@@ -738,6 +781,278 @@ async fn a_caller_group_survives_its_own_connect_and_carries_media_both_ways() {
         assert_eq!(pkt.data.as_ref(), message(seq).as_slice(), "caller group: message {seq}");
     }
     assert!(!terminal(group.status()), "caller group status: {:?}", group.status());
+
+    let _ = group.close().await;
+    let _ = accepted.close().await;
+    let _ = listener.close().await;
+}
+
+// ── Stranded members ────────────────────────────────────────────────────
+//
+// `SrtGroup::test_strand_member` marks a healthy member as if libsrt had
+// stranded it; the bridge then replaces it exactly as a really stranded one:
+// close it and connect the same endpoint again while another member is up,
+// or connect again first and close it once the replacement is up when it is
+// the only one. These pin that the replacement is invisible to the media
+// and to both ends' view of the group.
+
+/// The sequence number a numbered [`message`] carries, or `u32::MAX` when
+/// its payload is not intact.
+fn intact_seq(data: &[u8]) -> u32 {
+    let seq = u32::from_be_bytes(data[..4].try_into().unwrap());
+    if data == message(seq).as_slice() { seq } else { u32::MAX }
+}
+
+/// Numbered messages at 100/s until `stop`; yields how many were sent.
+fn group_sender(group: Arc<SrtGroup>, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        let mut seq: u32 = 0;
+        while !stop.load(Ordering::SeqCst) {
+            group.send(&message(seq)).await.expect("caller group send");
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        seq
+    })
+}
+
+fn listener_sender(sock: Arc<SrtSocket>, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        let mut seq: u32 = 0;
+        while !stop.load(Ordering::SeqCst) {
+            sock.send(&message(seq)).await.expect("listener send");
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        seq
+    })
+}
+
+/// Everything received until two seconds pass with nothing.
+fn group_receiver(group: Arc<SrtGroup>) -> tokio::task::JoinHandle<Vec<u32>> {
+    tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_secs(2), group.recv()).await {
+            got.push(intact_seq(&pkt.data));
+        }
+        got
+    })
+}
+
+fn listener_receiver(sock: Arc<SrtSocket>) -> tokio::task::JoinHandle<Vec<u32>> {
+    tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_secs(2), sock.recv()).await {
+            got.push(intact_seq(&pkt.data));
+        }
+        got
+    })
+}
+
+/// Every terminal status the caller group reports until `stop`.
+fn status_watch(group: Arc<SrtGroup>, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<Vec<SocketStatus>> {
+    tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while !stop.load(Ordering::SeqCst) {
+            let status = group.status();
+            if terminal(status) {
+                seen.push(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        seen
+    })
+}
+
+fn assert_all_in_order(side: &str, got: &[u32], sent: u32) {
+    let expected: Vec<u32> = (0..sent).collect();
+    assert!(sent > 50, "{side}: only {sent} messages sent");
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "{side}: received {} of {sent} messages (first missing: {:?})",
+        got.len(),
+        expected.iter().find(|s| !got.contains(s)),
+    );
+    assert_eq!(got, expected.as_slice(), "{side}: messages damaged, duplicated or reordered");
+}
+
+/// The id of the healthy member carrying `token`.
+fn healthy_id(members: &[GroupMemberStats], token: i32) -> i32 {
+    members
+        .iter()
+        .find(|m| m.token == token && healthy(m))
+        .unwrap_or_else(|| panic!("no healthy member {token}: {members:#?}"))
+        .id
+}
+
+/// Member `token` is carried by a healthy member other than `old`, and
+/// `old` has left the caller group.
+fn replaced(members: &[GroupMemberStats], token: i32, old: i32) -> bool {
+    members.iter().any(|m| m.token == token && m.id != old && healthy(m))
+        && !members.iter().any(|m| m.id == old)
+}
+
+/// A stranded member of a two-member broadcast group is closed and
+/// replaced with the same endpoint while the other carries everything: the
+/// receiver sees every message exactly once, in order, the group never
+/// reads terminal, and both ends end up listing two live members.
+///
+/// With `fixed_source_port` the member is bound to one fixed source
+/// `ip:port`, so its replacement binds it again while the closed member's
+/// multiplexer is still held, and shares it.
+async fn a_stranded_member_is_replaced_and_media_never_gaps(fixed_source_port: bool) {
+    let mut listener = group_listener().await;
+    let target = listener.local_addr();
+    let direct = GroupEndpoint::new(target, 0);
+    let mut second = GroupEndpoint::new(target, 1);
+    if fixed_source_port {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        second.local_addr = Some(probe.local_addr().unwrap());
+        drop(probe);
+    }
+    let group = connect_group(GroupMode::Broadcast, &[direct, second]).await;
+    let accepted = Arc::new(accept(&mut listener).await);
+    let before = wait_caller(&group, "both members healthy", |ms| {
+        token_healthy(ms, 0) && token_healthy(ms, 1)
+    })
+    .await;
+    let stranded = healthy_id(&before, 1);
+    wait_listener(&accepted, "two live members", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 2
+    })
+    .await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let statuses = status_watch(group.clone(), stop.clone());
+    let receiver = listener_receiver(accepted.clone());
+    let sender = group_sender(group.clone(), stop.clone());
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    group.test_strand_member(second).await.expect("mark member 1 stranded");
+    wait_caller(&group, "member 1 replaced, its predecessor closed", |ms| {
+        replaced(ms, 1, stranded) && token_healthy(ms, 0)
+    })
+    .await;
+    wait_listener(&accepted, "two live members again", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 2
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let sent = sender.await.unwrap();
+    let got = receiver.await.unwrap();
+    let statuses = statuses.await.unwrap();
+    assert!(statuses.is_empty(), "the caller group read terminal during the repair: {statuses:?}");
+    assert_all_in_order("listener", &got, sent);
+
+    let _ = group.close().await;
+    let _ = accepted.close().await;
+    let _ = listener.close().await;
+}
+
+/// A group's only connected member, when stranded, is replaced without the
+/// group or its peer ever losing the link: the replacement joins while the
+/// stranded member is still there, so neither end's group is ever empty
+/// (an empty mirror group fails whole on the listener, and an empty caller
+/// group restarts its sequence numbers). Media crosses both ways throughout.
+async fn a_groups_only_connected_member_is_replaced_in_place() {
+    let mut listener = group_listener().await;
+    let target = listener.local_addr();
+    let only = GroupEndpoint::new(target, 0);
+    let group = connect_group(GroupMode::Broadcast, &[only]).await;
+    let accepted = Arc::new(accept(&mut listener).await);
+    let before = wait_caller(&group, "the member healthy", |ms| token_healthy(ms, 0)).await;
+    let stranded = healthy_id(&before, 0);
+    wait_listener(&accepted, "one live member", |ms| ms.len() == 1 && healthy(&ms[0])).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let statuses = status_watch(group.clone(), stop.clone());
+    let at_listener = listener_receiver(accepted.clone());
+    let at_caller = group_receiver(group.clone());
+    let from_caller = group_sender(group.clone(), stop.clone());
+    let from_listener = listener_sender(accepted.clone(), stop.clone());
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    group.test_strand_member(only).await.expect("mark the member stranded");
+    wait_caller(&group, "the member replaced, its predecessor closed", |ms| {
+        replaced(ms, 0, stranded)
+    })
+    .await;
+    wait_listener(&accepted, "one live member again", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 1
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let (sent_by_caller, sent_by_listener) = (from_caller.await.unwrap(), from_listener.await.unwrap());
+    let (at_listener, at_caller) = (at_listener.await.unwrap(), at_caller.await.unwrap());
+    let statuses = statuses.await.unwrap();
+    assert!(statuses.is_empty(), "the caller group read terminal during the repair: {statuses:?}");
+    assert_eq!(group.status(), SocketStatus::Connected);
+    assert_all_in_order("listener", &at_listener, sent_by_caller);
+    assert_all_in_order("caller group", &at_caller, sent_by_listener);
+
+    let _ = group.close().await;
+    let _ = accepted.close().await;
+    let _ = listener.close().await;
+}
+
+/// A stranded standby of a backup group is replaced with its own weight and
+/// token, on both ends, while the primary carries every message.
+#[cfg(target_os = "linux")]
+async fn a_stranded_backup_standby_is_replaced() {
+    let mut listener = group_listener().await;
+    let target = listener.local_addr();
+    let mut primary = GroupEndpoint::new(target, 0);
+    primary.local_addr = Some(addr("127.0.0.2:0"));
+    primary.weight = 5;
+    let mut standby = GroupEndpoint::new(target, 1);
+    standby.local_addr = Some(addr("127.0.0.3:0"));
+    let group = connect_group(GroupMode::Backup, &[primary, standby]).await;
+    let accepted = Arc::new(accept(&mut listener).await);
+    let before = wait_caller(&group, "both members healthy", |ms| {
+        token_healthy(ms, 0) && token_healthy(ms, 1)
+    })
+    .await;
+    let stranded = healthy_id(&before, 1);
+    wait_listener(&accepted, "two live members", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 2
+    })
+    .await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let receiver = listener_receiver(accepted.clone());
+    let sender = group_sender(group.clone(), stop.clone());
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    group.test_strand_member(standby).await.expect("mark the standby stranded");
+    let after = wait_caller(&group, "the standby replaced, its predecessor closed", |ms| {
+        replaced(ms, 1, stranded) && token_healthy(ms, 0)
+    })
+    .await;
+    let weight_of = |token| after.iter().find(|m| m.token == token && healthy(m)).unwrap().weight;
+    assert_eq!(weight_of(0), 5, "caller primary weight: {after:#?}");
+    assert_eq!(weight_of(1), 0, "caller replacement standby weight: {after:#?}");
+    wait_listener(&accepted, "both members with their caller's weight, and only two", |ms| {
+        let weight_from = |ip: &str| {
+            ms.iter()
+                .find(|m| healthy(m) && m.peer_addr.is_some_and(|a| a.ip().to_string() == ip))
+                .map(|m| m.weight)
+        };
+        ms.iter().filter(|m| healthy(m)).count() == 2
+            && weight_from("127.0.0.2") == Some(5)
+            && weight_from("127.0.0.3") == Some(0)
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let sent = sender.await.unwrap();
+    let got = receiver.await.unwrap();
+    assert_all_in_order("listener", &got, sent);
 
     let _ = group.close().await;
     let _ = accepted.close().await;
