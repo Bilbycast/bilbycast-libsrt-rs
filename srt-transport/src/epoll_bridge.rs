@@ -42,6 +42,25 @@ const RECV_BUF_SIZE: usize = 65536;
 /// Maximum epoll events per wait call.
 const MAX_EPOLL_EVENTS: usize = 64;
 
+/// How often every live group is read whether or not libsrt raised its
+/// read-readiness.
+///
+/// libsrt can leave a group's due packets with no readiness raised. A
+/// member's TSBPD thread releases its receive lock to tell the group a
+/// packet is due (`CUDTGroup::updateReadState`, behind an `InvertedLock` in
+/// vendored `srtcore/core.cpp`, `CUDT::tsbpd`). A group read that lands in
+/// that window takes the packet — from this member, whose wake-up then
+/// reaches a thread that is not waiting, or from another member, discarding
+/// this one's copy with no wake-up at all — and the TSBPD thread, back from
+/// the group, sleeps with no deadline. Only new data on that member (its
+/// ACK) or a read from it wakes it again. Mid-stream the next ACK comes
+/// within about 10 ms; when the sender pauses or stops, the packets inside
+/// the latency window stay in the members' buffers until it resumes, or for
+/// good — the last ~10 messages of a stream that ends. A read finds them
+/// (`CUDTGroup::recv` checks each member's buffer against the clock itself)
+/// and, finding nothing more, restarts the member's TSBPD thread.
+const GROUP_RECV_SWEEP: std::time::Duration = std::time::Duration::from_millis(100);
+
 // ── Commands from Tokio tasks to the I/O thread ──
 
 #[allow(dead_code)]
@@ -268,6 +287,7 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
     const STATE_POLL_INTERVAL: u32 = 100; // poll socket state every ~100 iterations (~1s)
     let mut sock_id_buf: Vec<SocketId> = Vec::with_capacity(32); // reusable buffer
     let mut consecutive_epoll_errors: u32 = 0;
+    let mut last_group_sweep = std::time::Instant::now();
 
     loop {
         // ── Phase 0: Park when completely idle ──────────────────────────
@@ -408,6 +428,26 @@ fn io_thread_main(mut cmd_rx: mpsc::UnboundedReceiver<IoCommand>) {
                         handle_send(*id, &mut sockets);
                     }
                 }
+            }
+        }
+
+        // Read every live group on a timer as well as on IN: libsrt can
+        // leave a group's readiness unraised. See `GROUP_RECV_SWEEP`.
+        if has_connected && last_group_sweep.elapsed() >= GROUP_RECV_SWEEP {
+            last_group_sweep = std::time::Instant::now();
+            sock_id_buf.clear();
+            sock_id_buf.extend(
+                sockets
+                    .iter()
+                    .filter(|(id, s)| {
+                        is_group_id(**id)
+                            && s.last_status == SocketStatus::Connected
+                            && s.recv_tx.as_ref().is_some_and(|tx| !tx.is_closed())
+                    })
+                    .map(|(id, _)| *id),
+            );
+            for id in sock_id_buf.iter().copied() {
+                handle_recv(id, &mut sockets, &mut recv_buf);
             }
         }
 
@@ -896,28 +936,73 @@ fn close_and_release(
     sockets.remove(&id)
 }
 
-/// Drain all available messages from the socket's receive buffer.
+/// libsrt's group-id bit (`SRTGROUP_MASK`, vendored `srtcore/srt.h:141`),
+/// which libsrt itself tests to tell a group from a socket. bindgen does not
+/// emit it: it is a `static const` in the header, not a macro or an enum.
+const SRTGROUP_MASK: SocketId = 1 << 30;
+
+/// Whether `id` names a socket group: a caller group from `CreateGroup`, or
+/// a listener's mirror group handed out by `srt_accept` on a `group_connect`
+/// listener (registered by `RegisterSocket` like any accepted socket, so its
+/// `SocketState::is_group` is false — hence the id test).
+fn is_group_id(id: SocketId) -> bool {
+    id >= 0 && id & SRTGROUP_MASK != 0
+}
+
+/// Drain every message libsrt will hand over now.
 ///
-/// We check `SRTO_RCVDATA` before each `srt_recvmsg2` call to avoid hitting
-/// libsrt's "no data" exception path (`EASYNCRCV`). C++ stack unwinding is
-/// extremely expensive (~98% of srt-io CPU in profiling), so we must never
-/// call `srt_recvmsg2` when the buffer is empty.
-fn handle_recv(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>, recv_buf: &mut [u8]) {
+/// For a single socket, `SRTO_RCVDATA` is checked before each
+/// `srt_recvmsg2` call to avoid libsrt's "no data" exception path
+/// (`EASYNCRCV`): C++ stack unwinding is expensive (~98% of srt-io CPU in
+/// profiling), so a socket's buffer is not read once it reports empty.
+///
+/// **A group is read until `srt_recvmsg2` fails, with no such check.**
+/// `SRTO_RCVDATA` on a group id is not the group's: `CUDTGroup::getOpt`
+/// answers it from the group's *first listed member* (vendored
+/// `srtcore/group.cpp`, "Return the value from the first member socket"),
+/// and members are listed in the order they joined. When that member is
+/// the one that went dark — the link a bonded receiver exists to survive —
+/// it reads 0 while the live member's buffer fills. Stopping there was not
+/// a skipped read but a permanent stall: a group's read-readiness is
+/// edge-triggered here, and libsrt clears it only inside `CUDTGroup::recv`
+/// (when it finds nothing readable, or after a read that leaves no member
+/// ready), so a set readiness that is never read never produces another
+/// edge. The receiver went silent for the rest of the connection.
+///
+/// The cost is the exception this check was avoiding, once per drain. It
+/// was already being paid: `SRTO_RCVDATA` counts every contiguous packet,
+/// including those still waiting out the TSBPD latency (`CRcvBuffer::
+/// getRcvDataSize`), so on a live group it was nearly always non-zero and
+/// each drain already ended in an `EASYNCRCV` from `srt_recvmsg2`.
+///
+/// A group with no Idle or Running member is not read: its readiness at
+/// that point is libsrt waking pollers on a dying group, and `CUDTGroup::
+/// recv` on a group that has lost every member logs an Error-level
+/// "ABANDONING" line rather than just failing.
+fn handle_recv(
+    sock_id: SocketId,
+    sockets: &mut HashMap<SocketId, SocketState>,
+    recv_buf: &mut [u8],
+) {
+    let group = is_group_id(sock_id);
+    if group && unsafe { srt_getsockstate(sock_id) } != SRTS_CONNECTED {
+        return;
+    }
     loop {
-        // Check how many packets are buffered before attempting recv.
-        // This avoids the C++ exception that srt_recvmsg2 throws on empty buffer.
-        let mut rcv_data: i32 = 0;
-        let mut optlen: c_int = std::mem::size_of::<i32>() as c_int;
-        let ok = unsafe {
-            srt_getsockflag(
-                sock_id,
-                SRTO_RCVDATA,
-                &mut rcv_data as *mut i32 as *mut std::ffi::c_void,
-                &mut optlen,
-            )
-        };
-        if ok < 0 || rcv_data <= 0 {
-            break; // No data available or socket error — exit without calling recv
+        if !group {
+            let mut rcv_data: i32 = 0;
+            let mut optlen: c_int = std::mem::size_of::<i32>() as c_int;
+            let ok = unsafe {
+                srt_getsockflag(
+                    sock_id,
+                    SRTO_RCVDATA,
+                    &mut rcv_data as *mut i32 as *mut std::ffi::c_void,
+                    &mut optlen,
+                )
+            };
+            if ok < 0 || rcv_data <= 0 {
+                break; // No data available or socket error — exit without calling recv
+            }
         }
 
         // Allocate msgctrl on the I/O thread's stack so we can read
@@ -937,7 +1022,7 @@ fn handle_recv(sock_id: SocketId, sockets: &mut HashMap<SocketId, SocketState>, 
             )
         };
         if ret <= 0 {
-            break; // Unexpected: RCVDATA said data exists but recv failed
+            break; // Nothing more now (EASYNCRCV), or the socket failed
         }
         let data = Bytes::copy_from_slice(&recv_buf[..ret as usize]);
         // srctime == 0 ⇒ the sender's msgctrl was NULL on srt_sendmsg2

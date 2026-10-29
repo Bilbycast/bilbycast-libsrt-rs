@@ -21,6 +21,13 @@
 //! nothing (bilbycast-edge #184). Every case below fails on the code before
 //! those fixes — the member cases do not even compile against it.
 //!
+//! A group *receiver* also went silent for good once the member it listed
+//! first went dark, though its other link carried everything; and libsrt can
+//! lose a member's TSBPD wake-up, stranding the last latency-window of a
+//! stream that stops. The media cases here end the stream and wait for its
+//! tail, so they cover both (`epoll_bridge.rs`, `handle_recv` and
+//! `GROUP_RECV_SWEEP`).
+//!
 //! # Why `harness = false`
 //!
 //! Same reason as `listener_access_control.rs`, whose module docs carry the
@@ -70,6 +77,10 @@ fn main() {
         println!("test weight_and_token_reach_both_ends ... ok");
         passed += 1;
     }
+
+    rt.block_on(a_dark_first_member_stalls_neither_receiver());
+    println!("test a_dark_first_member_stalls_neither_receiver ... ok");
+    passed += 1;
 
     rt.block_on(a_broken_member_is_re_added_and_media_never_gaps(false));
     println!("test a_broken_member_is_re_added_and_media_never_gaps ... ok");
@@ -312,6 +323,108 @@ async fn weight_and_token_reach_both_ends() {
         weight_from("127.0.0.2") == Some(5) && weight_from("127.0.0.3") == Some(0)
     })
     .await;
+
+    let _ = group.close().await;
+    let _ = accepted.close().await;
+    let _ = listener.close().await;
+}
+
+/// A group receiver keeps delivering when the member it lists first goes
+/// dark and a later member carries everything — on a listener's mirror group
+/// and on a caller group alike.
+///
+/// libsrt answers `SRTO_RCVDATA` on a group id from the group's **first
+/// listed member** (`CUDTGroup::getOpt`), and the bridge stopped reading a
+/// group the moment that said 0. A group's read-readiness is edge-triggered
+/// in the bridge, and libsrt clears it only inside `CUDTGroup::recv`, so one
+/// skipped read left it set for good: no edge fired again, and the receiver
+/// went silent for the rest of the connection while every packet piled up
+/// in the live member's buffer. Members are listed in the order they joined,
+/// so connecting the black-holed link first makes it the member consulted
+/// on both ends: before the fix both receivers stopped at the outage on
+/// every run (20 of 80 messages). The re-add case below hit the same stall
+/// only when its black-holed link happened to reach the listener first.
+async fn a_dark_first_member_stalls_neither_receiver() {
+    const BEFORE: u32 = 20;
+    const DURING: u32 = 60;
+
+    let mut listener = group_listener().await;
+    let target = listener.local_addr();
+    let hole = Blackhole::start(target).await;
+
+    // The link through the hole joins first, on both ends.
+    let group = connect_group(GroupMode::Broadcast, &[GroupEndpoint::new(hole.addr, 0)]).await;
+    let accepted = Arc::new(accept(&mut listener).await);
+    wait_caller(&group, "member 0 healthy", |ms| token_healthy(ms, 0)).await;
+    wait_listener(&accepted, "the first member", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 1
+    })
+    .await;
+    let dark_on_listener = accepted.member_stats().await[0].id;
+
+    group.add_member(GroupEndpoint::new(target, 1)).await.expect("add the direct member");
+    wait_caller(&group, "both members healthy", |ms| {
+        token_healthy(ms, 0) && token_healthy(ms, 1)
+    })
+    .await;
+    wait_listener(&accepted, "two live members", |ms| {
+        ms.iter().filter(|m| healthy(m)).count() == 2
+    })
+    .await;
+    assert_eq!(group.member_stats().await[0].token, 0, "caller group lists the direct link first");
+    assert_eq!(
+        accepted.member_stats().await[0].id,
+        dark_on_listener,
+        "listener group lists the direct link first"
+    );
+
+    // A message is its sequence number only if its whole payload is intact.
+    fn seq_of(data: &[u8]) -> u32 {
+        let seq = u32::from_be_bytes(data[..4].try_into().unwrap());
+        if data == message(seq).as_slice() { seq } else { u32::MAX }
+    }
+    // Two seconds of silence after the last send ends each read.
+    let at_listener = {
+        let accepted = accepted.clone();
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_secs(2), accepted.recv()).await {
+                got.push(seq_of(&pkt.data));
+            }
+            got
+        })
+    };
+    let at_caller = {
+        let group = group.clone();
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_secs(2), group.recv()).await {
+                got.push(seq_of(&pkt.data));
+            }
+            got
+        })
+    };
+
+    // Both directions at once; the hole goes dark partway, well inside the
+    // 1 s peer-idle timeout, so the dark member stays listed first throughout.
+    for seq in 0..BEFORE + DURING {
+        if seq == BEFORE {
+            hole.set_dropping(true);
+        }
+        group.send(&message(seq)).await.expect("caller group send");
+        accepted.send(&message(seq)).await.expect("listener send");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let expected: Vec<u32> = (0..BEFORE + DURING).collect();
+    let (at_listener, at_caller) = (at_listener.await.unwrap(), at_caller.await.unwrap());
+    assert!(
+        at_listener == expected && at_caller == expected,
+        "each side must get all {} messages exactly once, in order; the listener got {}, the caller group {}",
+        expected.len(),
+        at_listener.len(),
+        at_caller.len()
+    );
 
     let _ = group.close().await;
     let _ = accepted.close().await;
