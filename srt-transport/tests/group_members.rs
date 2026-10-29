@@ -91,6 +91,14 @@ fn main() {
     println!("test losing_every_member_still_tears_the_group_down ... ok");
     passed += 1;
 
+    // Counts this process's open fds through `/proc/self/fd`.
+    #[cfg(target_os = "linux")]
+    {
+        rt.block_on(a_failed_group_connect_leaves_no_group_behind());
+        println!("test a_failed_group_connect_leaves_no_group_behind ... ok");
+        passed += 1;
+    }
+
     println!("\ntest result: ok. {passed} passed; 0 failed");
     let _ = std::io::stdout().flush();
 
@@ -489,6 +497,68 @@ async fn losing_every_member_still_tears_the_group_down() {
     let _ = group.close().await;
     let _ = accepted.close().await;
     let _ = listener.close().await;
+}
+
+#[cfg(target_os = "linux")]
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").expect("/proc/self/fd").count()
+}
+
+/// A group connect that spawns no member — here because no member's source
+/// can be bound (TEST-NET-1 and -2 are never local) — releases the group it
+/// created. libsrt keeps such a group, with its two kernel epoll fds, and
+/// nothing closed it: a caller retrying that configuration every few
+/// seconds leaked two fds per attempt until the process ran out.
+#[cfg(target_os = "linux")]
+async fn a_failed_group_connect_leaves_no_group_behind() {
+    const ATTEMPTS: usize = 20;
+
+    async fn failed_connect() {
+        let mut a = GroupEndpoint::new(addr("127.0.0.1:9"), 0);
+        a.local_addr = Some(addr("192.0.2.1:0"));
+        let mut b = GroupEndpoint::new(addr("127.0.0.1:9"), 1);
+        b.local_addr = Some(addr("198.51.100.1:0"));
+        let result = SrtGroup::builder(GroupMode::Broadcast)
+            .live_mode()
+            .connect_timeout(Duration::from_secs(3))
+            .add_member(a)
+            .add_member(b)
+            .connect()
+            .await;
+        // `SocketFail` is what libsrt records for a member whose source it
+        // cannot bind; bilbycast-edge words exactly that error as a bind
+        // failure naming the source, so it is pinned here.
+        assert_eq!(
+            result.err(),
+            Some(SrtError::SocketFail),
+            "a group with no bindable member: wrong outcome"
+        );
+    }
+
+    // Once first, then past libsrt's 1 s garbage-collector pass, so the
+    // baseline holds nothing the earlier cases or the first attempt are
+    // still releasing.
+    failed_connect().await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let before = open_fds();
+
+    for _ in 0..ATTEMPTS {
+        failed_connect().await;
+    }
+    // A closed group is freed on the collector's next pass.
+    let start = Instant::now();
+    loop {
+        let after = open_fds();
+        if after <= before + 2 {
+            break;
+        }
+        assert!(
+            start.elapsed() < DEADLINE,
+            "{ATTEMPTS} failed group connects left {} fds open ({before} before, {after} after)",
+            after - before
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn terminal(s: SocketStatus) -> bool {

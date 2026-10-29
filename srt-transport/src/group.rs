@@ -449,7 +449,9 @@ impl SrtGroupBuilder {
     ///
     /// Every endpoint is [checked](GroupEndpoint::check) first: libsrt
     /// refuses the whole call for one bad member, so a bad one is reported
-    /// here, before any group exists.
+    /// here, before any group exists. When libsrt spawns no member (each
+    /// one refused, e.g. a `local_addr` this host cannot bind), the group
+    /// already created is closed before the error is returned.
     pub async fn connect(self) -> Result<Arc<SrtGroup>, SrtError> {
         if self.endpoints.is_empty() {
             return Err(SrtError::InvalidParam);
@@ -487,7 +489,17 @@ impl SrtGroupBuilder {
             endpoints: self.endpoints.clone(),
             reply: conn_tx,
         });
-        conn_rx.await.map_err(|_| SrtError::SocketFail)??;
+        if let Err(e) = conn_rx.await.map_err(|_| SrtError::SocketFail).and_then(|r| r) {
+            // libsrt keeps a group whose `srt_connect_group` spawned no
+            // member, and nothing else would ever close this one: no
+            // `SrtGroup` owns it yet, and the bridge's zombie sweep skips
+            // groups. Left open, every failed connect kept a libsrt group
+            // (two kernel epoll fds) and its bridge entry for good, so a
+            // caller retrying members whose sources this host cannot bind
+            // leaked them on every attempt.
+            io.send_command(IoCommand::Close { id });
+            return Err(e);
+        }
 
         Ok(Arc::new(SrtGroup {
             id,
