@@ -5,6 +5,18 @@
 //!
 //! Uses libsrt's native socket group API (`srt_create_group`, `srt_connect_group`)
 //! to provide multi-link SRT connections with automatic deduplication and failover.
+//!
+//! # Members are not self-healing
+//!
+//! libsrt removes a broken member from its group and leaves bringing it back
+//! to the application (vendored `docs/features/socket-groups.md`, "the
+//! application should reconnect it"). [`SrtGroup::add_member`] is that
+//! reconnect: it prepares one endpoint exactly as the initial connect did —
+//! same source address, weight and token — and hands it to
+//! `srt_connect_group`, which is what upstream's own `testing/testmedia.cpp`
+//! does. Each member carries a caller-chosen *token* ([`GroupEndpoint::token`],
+//! read back on [`GroupMemberStats::token`]) so a member listed by
+//! [`SrtGroup::member_stats`] can be matched to the endpoint that created it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,6 +32,61 @@ use srt_protocol::stats::SrtStats;
 
 use crate::epoll_bridge::{io_handle, IoCommand, IoHandle, SocketId};
 
+/// The greatest member weight libsrt accepts (`CUDT::MAX_WEIGHT`,
+/// vendored `srtcore/core.h`). A weight above it makes libsrt refuse the
+/// **whole** `srt_connect_group` call, not just that member.
+pub const MAX_GROUP_MEMBER_WEIGHT: u16 = 32767;
+
+/// One member link to connect into an [`SrtGroup`]: the target, an optional
+/// source address to bind, the member's libsrt weight and its token.
+///
+/// - `local_addr` — bound before connecting, so the member leaves from that
+///   source IP (and port, when non-zero). The kernel still routes by its
+///   table; this is a source-address pin, not `SO_BINDTODEVICE`. `None`
+///   leaves the member unbound. Must be the same address family as `addr`.
+/// - `weight` — libsrt's member weight: in backup mode the **greater** weight
+///   is preferred, `0..=`[`MAX_GROUP_MEMBER_WEIGHT`]. Broadcast mode ignores
+///   it. It travels in the group handshake, so a listener's mirror group
+///   sees it too.
+/// - `token` — an opaque, caller-chosen identifier libsrt stores on the
+///   member and reports back in [`GroupMemberStats::token`]. It never goes on
+///   the wire. Must be `>= 0` (libsrt reads `-1` as "generate one for me").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupEndpoint {
+    pub addr: SocketAddr,
+    pub local_addr: Option<SocketAddr>,
+    pub weight: u16,
+    pub token: i32,
+}
+
+impl GroupEndpoint {
+    /// An unbound member with weight 0.
+    pub fn new(addr: SocketAddr, token: i32) -> Self {
+        Self {
+            addr,
+            local_addr: None,
+            weight: 0,
+            token,
+        }
+    }
+
+    /// Refuse what libsrt would refuse for the whole group call (a source of
+    /// a different family from the target, a weight above
+    /// [`MAX_GROUP_MEMBER_WEIGHT`]) and a negative token, which libsrt would
+    /// replace with one of its own and so break matching.
+    pub fn check(&self) -> Result<(), SrtError> {
+        if let Some(local) = self.local_addr {
+            if local.is_ipv4() != self.addr.is_ipv4() {
+                return Err(SrtError::InvalidParam);
+            }
+        }
+        if self.weight > MAX_GROUP_MEMBER_WEIGHT || self.token < 0 {
+            return Err(SrtError::InvalidParam);
+        }
+        Ok(())
+    }
+}
+
 /// Per-member state and statistics snapshot for one link inside an
 /// [`SrtGroup`]. Obtained via [`SrtGroup::member_stats`].
 #[derive(Debug, Clone)]
@@ -34,9 +101,16 @@ pub struct GroupMemberStats {
     /// Group-level member status: Pending / Idle (backup standby) / Running
     /// (active) / Broken.
     pub member_status: MemberStatus,
-    /// Member priority (backup mode). 0 means "equal priority"; lower
-    /// values are preferred when multiple members are healthy.
+    /// libsrt's member weight (backup mode): the **greater** weight is
+    /// preferred, `0..=`[`MAX_GROUP_MEMBER_WEIGHT`]; all-equal means libsrt
+    /// picks. On a caller group it is what [`GroupEndpoint::weight`] set; on a
+    /// listener's mirror group it is what the remote caller sent in the group
+    /// handshake.
     pub weight: u16,
+    /// The [`GroupEndpoint::token`] the member was created with (caller
+    /// groups); libsrt-generated on a listener's mirror group. Matches a
+    /// member back to its endpoint, which `peer_addr` cannot do reliably.
+    pub token: i32,
     /// Per-member traffic stats — RTT, rates, packet/byte counters,
     /// ARQ, FEC. Zeroed when libsrt reports the member as broken.
     pub stats: SrtStats,
@@ -146,6 +220,36 @@ impl SrtGroup {
         &self.endpoints
     }
 
+    /// Connect one more member into this live group — typically to bring
+    /// back a member libsrt removed as broken, with the same
+    /// [`GroupEndpoint`] (source, weight, token) it was first created with.
+    ///
+    /// Returns once the member is spawned; its handshake completes in the
+    /// background and shows up on [`SrtGroup::member_stats`] (`Pending`, then
+    /// `Idle`/`Running`, or gone if it fails). The member inherits the
+    /// group's options and joins at the group's current sequence number.
+    ///
+    /// **Refused (`ConnectionLost`) unless at least one member is Idle or
+    /// Running**, checked on the I/O thread immediately before the connect.
+    /// libsrt counts a *pending* member as healthy when deciding whether the
+    /// group has failed, so a member added to a group with no live link
+    /// would keep a dead group in `Connecting` — its sends stalled — instead
+    /// of letting it break and be redialled whole. Also refused once the
+    /// group has been closed or the bridge has seen it break.
+    ///
+    /// A bind failure on `local_addr` is reported as itself, not as a
+    /// generic connection loss.
+    pub async fn add_member(&self, ep: GroupEndpoint) -> Result<(), SrtError> {
+        ep.check()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.io.send_command(IoCommand::AddGroupMember {
+            id: self.id,
+            endpoint: ep,
+            reply: reply_tx,
+        });
+        reply_rx.await.map_err(|_| SrtError::SocketFail)?
+    }
+
     /// Get the current group status.
     pub fn status(&self) -> SocketStatus {
         *self.status_rx.borrow()
@@ -168,7 +272,7 @@ impl Drop for SrtGroup {
 pub struct SrtGroupBuilder {
     mode: GroupMode,
     config: SrtConfig,
-    endpoints: Vec<SocketAddr>,
+    endpoints: Vec<GroupEndpoint>,
 }
 
 impl SrtGroupBuilder {
@@ -180,9 +284,19 @@ impl SrtGroupBuilder {
         }
     }
 
-    /// Add an endpoint to the group.
+    /// Add an endpoint to the group: unbound, weight 0, with its index in
+    /// the builder as its token. Use [`SrtGroupBuilder::add_member`] to set a
+    /// source address, a weight or a token of your own — mixing the two
+    /// can give two members the same token.
     pub fn add_endpoint(mut self, addr: SocketAddr) -> Self {
-        self.endpoints.push(addr);
+        let token = self.endpoints.len() as i32;
+        self.endpoints.push(GroupEndpoint::new(addr, token));
+        self
+    }
+
+    /// Add a fully specified member. See [`GroupEndpoint`].
+    pub fn add_member(mut self, ep: GroupEndpoint) -> Self {
+        self.endpoints.push(ep);
         self
     }
 
@@ -332,9 +446,16 @@ impl SrtGroupBuilder {
     }
 
     /// Connect the group to all configured endpoints.
+    ///
+    /// Every endpoint is [checked](GroupEndpoint::check) first: libsrt
+    /// refuses the whole call for one bad member, so a bad one is reported
+    /// here, before any group exists.
     pub async fn connect(self) -> Result<Arc<SrtGroup>, SrtError> {
         if self.endpoints.is_empty() {
             return Err(SrtError::InvalidParam);
+        }
+        for ep in &self.endpoints {
+            ep.check()?;
         }
 
         let io = io_handle();
@@ -375,7 +496,83 @@ impl SrtGroupBuilder {
             recv_rx: tokio::sync::Mutex::new(recv_rx),
             status_rx,
             mode: self.mode,
-            endpoints: self.endpoints,
+            endpoints: self.endpoints.iter().map(|ep| ep.addr).collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// libsrt throws `MN_INVAL` for the whole `srt_connect_group` call when a
+    /// member's source family differs from its target's.
+    #[test]
+    fn group_endpoint_check_refuses_a_family_mismatch() {
+        let mut ep = GroupEndpoint::new(v4("[2001:db8::1]:9000"), 0);
+        ep.local_addr = Some(v4("192.0.2.1:0"));
+        assert_eq!(ep.check(), Err(SrtError::InvalidParam));
+        ep.local_addr = Some(v4("[::]:0"));
+        assert_eq!(ep.check(), Ok(()));
+    }
+
+    /// `CUDT::MAX_WEIGHT` is 32767; one above it fails the whole group call.
+    #[test]
+    fn group_endpoint_check_refuses_weight_above_libsrt_max() {
+        let mut ep = GroupEndpoint::new(v4("127.0.0.1:9000"), 0);
+        ep.weight = MAX_GROUP_MEMBER_WEIGHT;
+        assert_eq!(ep.check(), Ok(()));
+        ep.weight = MAX_GROUP_MEMBER_WEIGHT + 1;
+        assert_eq!(ep.check(), Err(SrtError::InvalidParam));
+    }
+
+    /// A negative token would be replaced by a libsrt-generated one, and the
+    /// member could no longer be matched to its endpoint.
+    #[test]
+    fn group_endpoint_check_refuses_a_negative_token() {
+        assert_eq!(
+            GroupEndpoint::new(v4("127.0.0.1:9000"), -1).check(),
+            Err(SrtError::InvalidParam)
+        );
+    }
+
+    /// The legacy `add_endpoint(SocketAddr)` keeps producing today's libsrt
+    /// call — no source, weight 0 — and now names each member by its index.
+    #[test]
+    fn add_endpoint_is_unbound_weight_zero_with_index_tokens() {
+        let b = SrtGroup::builder(GroupMode::Broadcast)
+            .add_endpoint(v4("127.0.0.1:9000"))
+            .add_endpoint(v4("127.0.0.1:9001"));
+        assert_eq!(
+            b.endpoints,
+            vec![
+                GroupEndpoint::new(v4("127.0.0.1:9000"), 0),
+                GroupEndpoint::new(v4("127.0.0.1:9001"), 1),
+            ]
+        );
+        assert!(b.endpoints.iter().all(|ep| ep.local_addr.is_none() && ep.weight == 0));
+    }
+
+    /// A bad member is refused before any group is created: `connect`
+    /// returns `InvalidParam` without a round trip to the I/O thread.
+    #[test]
+    fn builder_refuses_bad_endpoint_before_touching_libsrt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut bad = GroupEndpoint::new(v4("127.0.0.1:9001"), 1);
+        bad.weight = MAX_GROUP_MEMBER_WEIGHT + 1;
+        let result = rt.block_on(
+            SrtGroup::builder(GroupMode::Backup)
+                .add_endpoint(v4("127.0.0.1:9000"))
+                .add_member(bad)
+                .connect(),
+        );
+        assert_eq!(result.err(), Some(SrtError::InvalidParam));
     }
 }

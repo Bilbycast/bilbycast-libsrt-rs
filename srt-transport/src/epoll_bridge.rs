@@ -31,6 +31,7 @@ use srt_protocol::access_control::{AccessControl, HandshakeInfo};
 
 use crate::stats_bridge::convert_perfmon_to_stats;
 use crate::error::last_srt_error;
+use crate::group::{GroupEndpoint, MAX_GROUP_MEMBER_WEIGHT};
 
 /// Opaque identifier for sockets managed by the I/O thread.
 pub(crate) type SocketId = i32; // SRTSOCKET is i32
@@ -122,7 +123,15 @@ pub(crate) enum IoCommand {
     /// Connect a group to multiple endpoints.
     ConnectGroup {
         id: SocketId,
-        endpoints: Vec<SocketAddr>,
+        endpoints: Vec<GroupEndpoint>,
+        reply: oneshot::Sender<Result<(), SrtError>>,
+    },
+    /// Connect one more member into a live group (re-adding a member libsrt
+    /// removed as broken). Refused unless the group still has a live member;
+    /// see [`add_group_member`].
+    AddGroupMember {
+        id: SocketId,
+        endpoint: GroupEndpoint,
         reply: oneshot::Sender<Result<(), SrtError>>,
     },
     /// Get per-member statistics for a socket group (bonding).
@@ -801,7 +810,7 @@ fn process_command(
         }
 
         IoCommand::ConnectGroup { id, endpoints, reply } => {
-            let result = connect_group(id, &endpoints, epoll_id);
+            let result = connect_group(id, &endpoints).map(|_| ());
             if result.is_ok() {
                 add_to_epoll(
                     epoll_id,
@@ -814,6 +823,10 @@ fn process_command(
                 }
             }
             let _ = reply.send(result);
+        }
+
+        IoCommand::AddGroupMember { id, endpoint, reply } => {
+            let _ = reply.send(add_group_member(id, &endpoint, sockets));
         }
 
         IoCommand::GetGroupMemberStats { id, reply } => {
@@ -1289,27 +1302,48 @@ fn bind_socket(sock: SocketId, addr: SocketAddr) -> Result<(), SrtError> {
     }
 }
 
+/// Build libsrt's per-member connect record for one [`GroupEndpoint`]:
+/// target, optional source, weight and token.
+///
+/// `srt_prepare_endpoint` copies `namelen` bytes from both the source and the
+/// target (vendored `srtcore/srt_c_api.cpp`), so both are passed as full
+/// `sockaddr_storage`. With no source it zeroes the source and gives it the
+/// target's family, which libsrt reads as "do not bind".
+fn prepare_target(ep: &GroupEndpoint) -> SRT_SOCKGROUPCONFIG {
+    let dst = socket_addr_to_sockaddr(&ep.addr);
+    let src = ep.local_addr.as_ref().map(socket_addr_to_sockaddr);
+    let src_ptr = src.as_ref().map_or(std::ptr::null(), |sa| {
+        sa as *const libc::sockaddr_storage as *const std::ffi::c_void as *const sockaddr
+    });
+    let mut target = unsafe {
+        srt_prepare_endpoint(
+            src_ptr,
+            &dst as *const libc::sockaddr_storage as *const std::ffi::c_void as *const _,
+            std::mem::size_of::<libc::sockaddr_storage>() as c_int,
+        )
+    };
+    target.weight = ep.weight.min(MAX_GROUP_MEMBER_WEIGHT);
+    target.token = ep.token;
+    target
+}
+
+/// Connect `endpoints` into group `grp`, one libsrt member each.
+///
+/// The outer `Err` is libsrt refusing the call as a whole. When no member
+/// could be spawned, libsrt reports a generic `CONNLOST`; the first
+/// per-member error code is returned instead when there is one, so a bind
+/// failure on a member's source reads as itself. The inner results are per
+/// member, in order: `Ok(member id)` for a member spawned into the group (its
+/// handshake continues in the background), `Err` for one that was not.
 fn connect_group(
     grp: SocketId,
-    endpoints: &[SocketAddr],
-    _epoll_id: c_int,
-) -> Result<(), SrtError> {
+    endpoints: &[GroupEndpoint],
+) -> Result<Vec<Result<SocketId, SrtError>>, SrtError> {
     if endpoints.is_empty() {
         return Err(SrtError::InvalidParam);
     }
 
-    let mut targets: Vec<SRT_SOCKGROUPCONFIG> = Vec::with_capacity(endpoints.len());
-    for addr in endpoints {
-        let sa = socket_addr_to_sockaddr(addr);
-        let target = unsafe {
-            srt_prepare_endpoint(
-                std::ptr::null(),
-                &sa as *const libc::sockaddr_storage as *const std::ffi::c_void as *const _,
-                std::mem::size_of::<libc::sockaddr_storage>() as c_int,
-            )
-        };
-        targets.push(target);
-    }
+    let mut targets: Vec<SRT_SOCKGROUPCONFIG> = endpoints.iter().map(prepare_target).collect();
 
     let ret = unsafe {
         srt_connect_group(
@@ -1320,10 +1354,81 @@ fn connect_group(
     };
 
     if ret < 0 {
-        Err(last_srt_error())
-    } else {
-        Ok(())
+        // Read libsrt's thread-local error before anything else can touch it.
+        let call_error = last_srt_error();
+        return Err(targets
+            .iter()
+            .find(|t| t.errorcode != 0)
+            .map_or(call_error, |t| SrtError::from_code(t.errorcode)));
     }
+
+    let per_member: Vec<Result<SocketId, SrtError>> = targets
+        .iter()
+        .map(|t| {
+            if t.id >= 0 && t.errorcode == 0 {
+                Ok(t.id)
+            } else if t.errorcode != 0 {
+                Err(SrtError::from_code(t.errorcode))
+            } else {
+                Err(SrtError::ConnectionLost)
+            }
+        })
+        .collect();
+    for (ep, result) in endpoints.iter().zip(&per_member) {
+        if let Err(e) = result {
+            tracing::warn!(
+                "srt-io: group {} member {} (token {}, source {:?}) was not spawned: {:?}",
+                grp,
+                ep.addr,
+                ep.token,
+                ep.local_addr,
+                e,
+            );
+        }
+    }
+    Ok(per_member)
+}
+
+/// Connect one member into a live group.
+///
+/// **Refused unless the group has at least one Idle or Running member**, read
+/// here on the I/O thread right before `srt_connect_group`. libsrt's own
+/// test for a failed group (`CUDTGroup::updateFailedLink`) counts a
+/// *pending* member as healthy, and `getStatus` then reports that pending
+/// member's `CONNECTING` rather than `BROKEN`. A member added once every live
+/// link is gone would therefore keep the group from ever reaching a terminal
+/// state while its handshake runs: the bridge would not tear it down, the
+/// Tokio side would not see the loss and redial the group whole, and the
+/// send drain (gated on `Connected`) would stall with the send channel
+/// filling behind it. `srt_getsockstate` on a group is `getStatus`, which is
+/// `SRTS_CONNECTED` exactly when some member is Idle or Running.
+///
+/// The remaining window — the last live member breaks between this check
+/// and the connect — is bounded by one connect timeout: the new member
+/// either connects (the group recovers in place) or fails, and the bridge's
+/// state poll then sees the group `BROKEN`.
+///
+/// Also refused for a group the bridge no longer tracks or has already seen
+/// break, so a group whose Tokio side is gone is never revived. Makes no
+/// epoll or status change: the group is already registered.
+fn add_group_member(
+    id: SocketId,
+    endpoint: &GroupEndpoint,
+    sockets: &HashMap<SocketId, SocketState>,
+) -> Result<(), SrtError> {
+    let tracked = sockets
+        .get(&id)
+        .is_some_and(|s| s.is_group && !is_terminal_status(s.last_status));
+    if !tracked {
+        return Err(SrtError::ConnectionLost);
+    }
+    if unsafe { srt_getsockstate(id) } != SRTS_CONNECTED {
+        return Err(SrtError::ConnectionLost);
+    }
+    connect_group(id, std::slice::from_ref(endpoint))?
+        .pop()
+        .unwrap_or(Err(SrtError::ConnectionLost))
+        .map(|_| ())
 }
 
 fn get_socket_stats(sock: SocketId) -> Result<SrtStats, SrtError> {
@@ -1392,6 +1497,7 @@ fn get_group_member_stats(group_id: SocketId) -> Vec<crate::group::GroupMemberSt
                 socket_status,
                 member_status,
                 weight: m.weight,
+                token: m.token,
                 stats,
             }
         })
@@ -1727,6 +1833,115 @@ mod tests {
         assert!(state.recv_tx.is_some(), "registration dropped the group's receive channel");
         assert!(state.send_rx.is_some(), "registration dropped the group's send channel");
         assert_eq!(state.last_status, SocketStatus::Init);
+
+        close_and_release(epoll_id, grp, &mut sockets);
+        unsafe { srt_epoll_release(epoll_id) };
+    }
+
+    // ── Group members (bonding) ─────────────────────────────────────────
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn storage_to_addr<T>(raw: &T) -> Option<SocketAddr> {
+        let st: libc::sockaddr_storage = unsafe { std::mem::transmute_copy(raw) };
+        sockaddr_storage_to_socket_addr(&st)
+    }
+
+    /// The member record handed to `srt_connect_group` carries the source,
+    /// weight and token of its endpoint. Before this, every member was
+    /// prepared with a null source and libsrt's default weight 0 / token -1,
+    /// so a configured source address and weight never reached libsrt
+    /// (bilbycast-edge #184).
+    #[test]
+    fn prepare_target_carries_source_weight_and_token() {
+        let ep = GroupEndpoint {
+            addr: sa("10.1.2.3:9000"),
+            local_addr: Some(sa("192.0.2.7:4100")),
+            weight: 7,
+            token: 3,
+        };
+        let t = prepare_target(&ep);
+        assert_eq!(storage_to_addr(&t.peeraddr), Some(ep.addr));
+        assert_eq!(storage_to_addr(&t.srcaddr), ep.local_addr);
+        assert_eq!(t.weight, 7);
+        assert_eq!(t.token, 3);
+        assert_eq!(t.errorcode, 0);
+    }
+
+    /// No source: libsrt zeroes it and gives it the target's family, which
+    /// `groupConnect` reads as "do not bind". A source of the wrong family
+    /// would make libsrt refuse the whole group call.
+    #[test]
+    fn prepare_target_without_source_leaves_it_empty_with_target_family() {
+        let t = prepare_target(&GroupEndpoint::new(sa("[2001:db8::5]:9000"), 0));
+        assert_eq!(t.srcaddr.ss_family as i32, libc::AF_INET6);
+        assert_eq!(storage_to_addr(&t.srcaddr), Some(sa("[::]:0")));
+        assert_eq!(t.weight, 0);
+        assert_eq!(t.token, 0);
+    }
+
+    /// A group the bridge does not track (closed, or never created) is never
+    /// revived by a re-add.
+    #[test]
+    fn add_member_to_an_untracked_group_is_refused() {
+        let sockets: HashMap<SocketId, SocketState> = HashMap::new();
+        let ep = GroupEndpoint::new(sa("127.0.0.1:9"), 0);
+        assert_eq!(
+            add_group_member(0x4000_0001, &ep, &sockets),
+            Err(SrtError::ConnectionLost)
+        );
+    }
+
+    /// The atomic half of the "only while a member is live" rule: even when
+    /// the bridge still believes the group is connected, the add is refused
+    /// unless libsrt itself reports an Idle or Running member — and nothing
+    /// is spawned. A member added to a group with no live link counts as
+    /// healthy in libsrt's own failure test, so the group would sit in
+    /// `Connecting` (sends stalled) instead of breaking and being redialled.
+    #[test]
+    fn add_member_is_refused_while_no_member_is_idle_or_running() {
+        libsrt_sys::ensure_initialized();
+        let epoll_id = unsafe { srt_epoll_create() };
+        assert!(epoll_id >= 0, "srt_epoll_create failed");
+        let mut sockets: HashMap<SocketId, SocketState> = HashMap::new();
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(
+            IoCommand::CreateGroup {
+                mode: SRT_GTYPE_BROADCAST,
+                config: {
+                    let mut c = SrtConfig::default();
+                    c.live_defaults();
+                    c
+                },
+                reply: tx,
+            },
+            epoll_id,
+            &mut sockets,
+        );
+        let grp = rx.try_recv().expect("no reply").expect("srt_create_group failed");
+        // Pretend the bridge still has the group as live: the libsrt check
+        // must stand on its own.
+        sockets.get_mut(&grp).unwrap().last_status = SocketStatus::Connected;
+        assert_ne!(unsafe { srt_getsockstate(grp) }, SRTS_CONNECTED);
+
+        let (tx, mut rx) = oneshot::channel();
+        process_command(
+            IoCommand::AddGroupMember {
+                id: grp,
+                endpoint: GroupEndpoint::new(sa("127.0.0.1:9"), 0),
+                reply: tx,
+            },
+            epoll_id,
+            &mut sockets,
+        );
+        assert_eq!(rx.try_recv().expect("no reply"), Err(SrtError::ConnectionLost));
+        assert!(
+            get_group_member_stats(grp).is_empty(),
+            "a refused add still spawned a member"
+        );
 
         close_and_release(epoll_id, grp, &mut sockets);
         unsafe { srt_epoll_release(epoll_id) };

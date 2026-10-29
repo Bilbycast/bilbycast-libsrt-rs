@@ -57,6 +57,12 @@ Native SRT bonding via libsrt's socket group API:
 - `GroupMode::Broadcast` — SMPTE 2022-7 (all links active, deduplication by libsrt)
 - `GroupMode::Backup` — primary/backup with failover
 
+Each member is a `GroupEndpoint { addr, local_addr, weight, token }`, added with `SrtGroupBuilder::add_member` (`add_endpoint(addr)` is the unbound, weight-0 shorthand whose token is its index). `local_addr` is bound as the member's source; `weight` is **libsrt's** (greater is preferred, `0..=MAX_GROUP_MEMBER_WEIGHT` = 32767, carried to the peer in the group handshake); `token` is an opaque caller-chosen id read back on `GroupMemberStats::token`, so a listed member can be matched to its endpoint. `GroupEndpoint::check` refuses what libsrt would refuse for the **whole** group call (source/target family mismatch, weight > 32767) plus a negative token.
+
+libsrt removes a broken member and never brings it back; `SrtGroup::add_member(ep)` re-adds one into the live group (same source, weight, token — what upstream's `testing/testmedia.cpp` does). It is refused (`ConnectionLost`) unless the group still has an Idle or Running member, checked on the I/O thread right before `srt_connect_group`: libsrt counts a *pending* member as healthy, so a member added to a group with no live link would hold the dead group in `Connecting`, sends stalled, instead of letting it break and be redialled whole. Reconnect policy (when, how often, which source) belongs to the consumer — bilbycast-edge's `srt::bond_supervisor`.
+
+Two libsrt group quirks the bridge works around (`epoll_bridge.rs`): `CUDTGroup::addEPoll` raises ERR on a group whose members are all still connecting (`CUDTSocket::broken()` is `!m_bConnected`), so an ERR on a group is fatal only when `srt_getsockstate` (= `getStatus`) agrees; and a memberless group reads `SRTS_BROKEN`, so a group's status is not taken from libsrt until `ConnectGroup` has run. Before both, every caller group was torn down at birth. `tests/group_members.rs` drives all of this over loopback (Linux for the distinct-source cases).
+
 ### API Compatibility
 
 The shared half of the public API mirrors bilbycast-srt; the bonding half has no counterpart there, so swapping the edge's Cargo.toml path dependencies back to bilbycast-srt does not compile (edge issue #102):

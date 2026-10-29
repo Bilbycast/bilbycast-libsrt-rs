@@ -44,6 +44,10 @@
 //! - `Broadcast` mode: SMPTE 2022-7 hitless redundancy (all links active)
 //! - `Backup` mode: primary/backup with automatic failover
 //! - `Balancing` mode: load balancing across links
+//!
+//! libsrt drops a broken member and does not bring it back on its own;
+//! [`SrtGroup::add_member`] re-adds one (same source, weight and token, see
+//! [`GroupEndpoint`]) while the group still has a live member.
 
 pub(crate) mod epoll_bridge;
 pub(crate) mod error;
@@ -63,6 +67,8 @@ pub const BACKEND_NAME: &str = "libsrt";
 // Re-exports for convenience (matching bilbycast-srt/srt-transport API)
 pub use socket::{SrtSocket, SrtSocketBuilder};
 pub use listener::{SrtListener, SrtListenerBuilder};
-pub use group::{GroupMemberStats, GroupMode, SrtGroup, SrtGroupBuilder};
+pub use group::{
+    GroupEndpoint, GroupMemberStats, GroupMode, SrtGroup, SrtGroupBuilder, MAX_GROUP_MEMBER_WEIGHT,
+};
 pub use srt_protocol::config::{MemberStatus, SocketStatus};
 pub use srt_protocol::access_control::{AccessControl, AccessControlFn, HandshakeInfo};
