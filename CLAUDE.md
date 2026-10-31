@@ -51,6 +51,10 @@ All libsrt C API calls happen on a single dedicated OS thread (`srt-io`). Tokio 
 - **Thread safety**: libsrt sockets aren't thread-safe; single thread eliminates races
 - **Global singleton**: One I/O thread per process via `OnceLock`
 
+### Listener accepts
+
+The I/O thread `srt_accept`s a connection as soon as libsrt queues it (`handle_accept`) and puts its id in the listener's accept channel (16 deep); `SrtListener::accept` takes it from there. A connection accepted that way has left libsrt's own queue, so libsrt's clean-up of a closed listener no longer reaches it: whatever the bridge accepts, it must hand to an owner or close. Three paths used to do neither and left the connection open with no owner — still connected, its data read and discarded, libsrt answering the peer for it, so the peer sent to nothing for good and never redialled (bilbycast-edge: a caller redialling while the listening input's flow restarted went dark until the caller was restarted): a listener dropped with ids waiting in its channel, an id the channel refused (full, or closed by a dropped listener whose `Close` had not reached the I/O thread), and an `accept` future dropped part-way, after taking an id but before building the socket. Now `SrtListener::drop` closes the channel and closes every id waiting in it, `handle_accept` closes an id the channel refuses, and `accept` holds the id in a guard that closes it unless the socket is built, so dropping the future is safe. A closed connection sends its peer a shutdown. `tests/listener_unclaimed.rs` drives each path over loopback.
+
 ### Bonding
 
 Native SRT bonding via libsrt's socket group API:

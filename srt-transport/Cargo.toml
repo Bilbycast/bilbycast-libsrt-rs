@@ -30,6 +30,12 @@ harness = false
 name = "group_members"
 harness = false
 
+# Same reason: real listener and caller sockets, so it owns `main` and leaves
+# via `libc::_exit(0)`.
+[[test]]
+name = "listener_unclaimed"
+harness = false
+
 [features]
 # `SrtGroup::test_strand_member`, which makes the I/O thread replace a
 # healthy group member as if libsrt had stranded it. For this crate's own

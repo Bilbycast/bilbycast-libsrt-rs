@@ -35,9 +35,24 @@ impl SrtListener {
     /// Accept a new incoming connection.
     ///
     /// Returns an `SrtSocket` representing the accepted connection.
+    ///
+    /// Cancel safe in the sense that matters to a caller racing this against
+    /// a shutdown in `select!`: dropping the future never leaves a connection
+    /// open with no owner. Dropped while it waits, it takes nothing; dropped
+    /// after taking a connection, while the socket is still being built, it
+    /// closes that connection, and the peer sees it drop. Until 2026-11 the
+    /// second case left the connection open, connected to nothing for good.
     pub async fn accept(&mut self) -> Result<SrtSocket, SrtError> {
         match self.accept_rx.recv().await {
-            Some(sock_id) => SrtSocket::from_accepted(sock_id).await,
+            Some(sock_id) => {
+                let unclaimed = Unclaimed { id: sock_id, io: &self.io };
+                let sock = SrtSocket::from_accepted(sock_id).await;
+                if sock.is_ok() {
+                    // The socket owns the connection now, and closes it.
+                    unclaimed.claimed();
+                }
+                sock
+            }
             None => Err(SrtError::SocketClosed),
         }
     }
@@ -47,7 +62,8 @@ impl SrtListener {
         self.local_addr
     }
 
-    /// Close the listener.
+    /// Close the listener. Connections it accepted that [`Self::accept`] has
+    /// not handed out are closed when it is dropped.
     pub async fn close(&self) -> Result<(), SrtError> {
         self.io.send_command(IoCommand::Close { id: self.id });
         Ok(())
@@ -55,6 +71,45 @@ impl SrtListener {
 }
 
 impl Drop for SrtListener {
+    /// Close the listener, and every connection it accepted that
+    /// [`Self::accept`] never handed out.
+    ///
+    /// The I/O thread accepts a connection as soon as libsrt queues it, and
+    /// waits for the application to take it from the accept channel. A
+    /// listener dropped with connections waiting there, as a shutdown racing
+    /// a caller's (re)connect drops one, used to leave each of them open with
+    /// no owner: still connected, its data read and discarded by the I/O
+    /// thread, and libsrt answering the peer for it, so the peer kept
+    /// sending to nothing and never redialled — a new listener on the same
+    /// port never heard from it. The `Close` sent here reaches the I/O thread
+    /// later; closing the channel makes it close whatever it accepts until
+    /// then (`handle_accept`), and what is already waiting is closed here.
+    /// Each closed connection sends its peer a shutdown.
+    fn drop(&mut self) {
+        self.io.send_command(IoCommand::Close { id: self.id });
+        self.accept_rx.close();
+        while let Ok(id) = self.accept_rx.try_recv() {
+            self.io.send_command(IoCommand::Close { id });
+        }
+    }
+}
+
+/// A connection [`SrtListener::accept`] has taken from the accept channel and
+/// is still building a socket for: closed if dropped first, so an `accept`
+/// future abandoned part-way does not leave it open with no owner.
+struct Unclaimed<'a> {
+    id: SocketId,
+    io: &'a IoHandle,
+}
+
+impl Unclaimed<'_> {
+    /// The connection has its socket, which closes it from now on.
+    fn claimed(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Unclaimed<'_> {
     fn drop(&mut self) {
         self.io.send_command(IoCommand::Close { id: self.id });
     }

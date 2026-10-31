@@ -1320,6 +1320,23 @@ fn handle_accept(
         return; // Accept failed
     }
 
+    // Hand it to the listener's accept channel, or close it. A connection the
+    // channel cannot take — full (that many accepted and not yet taken), or
+    // closed because its `SrtListener` was dropped and the listener's `Close`
+    // has not reached this thread yet — has no owner. Until 2026-11 it was
+    // left open: connected, read and discarded here, answered by libsrt, so
+    // its peer sent to nothing for good instead of seeing the connection drop
+    // and redialling. Closed, it sends the peer a shutdown. Nothing else
+    // touches it before this returns, so it is configured after the hand-over.
+    let handed = sockets
+        .get(&listener_id)
+        .and_then(|state| state.accept_tx.as_ref())
+        .is_some_and(|tx| tx.try_send(accepted).is_ok());
+    if !handed {
+        unsafe { srt_close(accepted) };
+        return;
+    }
+
     // Set non-blocking on accepted socket
     set_bool_opt(accepted, SRTO_RCVSYN as c_int, false);
     set_bool_opt(accepted, SRTO_SNDSYN as c_int, false);
@@ -1334,13 +1351,6 @@ fn handle_accept(
         SRT_EPOLL_IN as c_int | SRT_EPOLL_ERR as c_int
             | SRT_EPOLL_ET as c_int,
     );
-
-    // Notify the listener's accept channel
-    if let Some(state) = sockets.get(&listener_id) {
-        if let Some(ref tx) = state.accept_tx {
-            let _ = tx.try_send(accepted);
-        }
-    }
 }
 
 /// Arm the listener's access-control hook.
