@@ -141,15 +141,18 @@ and for FEC to stay within its recovery window. Verified 5-of-5
 consecutive edge↔edge FEC+2022-7 runs on loopback pass with 0 decode
 errors, 0 RCV-DROPPED, 0 FEC-IPE.
 
-Secondary, narrower limitation: the raw-TS dedup path in the edge's
-2022-7 merger (`bilbycast-edge/src/engine/input_srt.rs::process_redundant_packet`)
-uses a per-leg synthetic counter rather than content. In steady state
-both legs deliver packets in the same order (TSBPD enforces that) so
-the counters stay aligned and dedup is correct. Counters drift only
-if **one leg permanently loses a packet** (past TSBPD) that the other
-delivers — after which both legs' Nth-packet-ever are different
-content and duplicates can reach the downstream muxer. Under FEC this
-is rare because single-packet losses are recovered on each leg before
-TSBPD. For asymmetric per-link loss that exceeds the FEC matrix on
-one leg only, wrap the upstream in RTP/TS so the merger has a real
-sequence number to key on.
+Secondary, narrower limitation: on **raw TS** (no RTP header) the edge's
+2022-7 SRT input does not merge its legs at all, because the legs share
+no sequence number (each SRT connection numbers its packets from its own
+ISN, and TS carries only a 4-bit continuity counter per PID). It runs
+active-leg failover instead (`RawTsFailover` in
+`bilbycast-edge/src/engine/input_srt.rs`): it forwards one leg and
+switches to the other only after the forwarded leg has delivered nothing
+for 50 ms. A raw-TS pair therefore protects only against a leg failing
+outright: a packet the forwarded leg loses past TSBPD is not filled from
+the other leg, and a failover skips or repeats some of the stream. For
+hitless merging, wrap the upstream in RTP/TS so the merger can key on
+the RTP sequence number both legs carry. (Until 2026-05 the
+edge keyed raw TS on a per-leg synthetic packet counter, which this
+paragraph described until 2026-10; that path is gone.) Reference:
+`bilbycast-edge/docs/configuration-guide.md`, "Raw TS 2022-7".
