@@ -262,14 +262,14 @@ dependencies = [
 
 [[package]]
 name = "srt-protocol"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "srt-transport"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bytes",
  "libc",
