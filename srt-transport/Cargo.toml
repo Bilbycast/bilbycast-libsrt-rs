@@ -48,9 +48,9 @@ test-hooks = []
 libsrt-sys = { path = "../libsrt-sys" }
 srt-protocol = { path = "../srt-protocol" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
-bytes = "1.12.1"
+bytes = "1.12.2"
 tracing = "0.1.44"
-libc = "0.2.190"
+libc = "0.2.191"
 
 [dev-dependencies]
 # Itself, with the test hooks: a self dev-dependency resolves to this same

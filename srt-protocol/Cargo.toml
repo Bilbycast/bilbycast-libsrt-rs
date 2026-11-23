@@ -7,4 +7,4 @@ description = "SRT protocol types — config, stats, errors, access control (API
 publish = false
 
 [dependencies]
-bytes = "1.12.1"
+bytes = "1.12.2"
